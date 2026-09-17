@@ -1007,7 +1007,7 @@ def parse_bestdopsa(lines):
                 'pdop': pdop,
                 'gdop': gdop,
                 'hdop': hdop,
-                'vdop': 0.0,  # VDOP not provided by BESTDOPSA; charts/statistics require the key
+                'vdop': None,  # VDOP 仅 GSA 提供；BESTDOPSA 无此字段，用 None 触发下游 N/A 判定（不硬编码数值）
                 'tdop': float(p_fields[3]),
                 'htdop': float(p_fields[4]),
                 'elev_mask': float(p_fields[5]),
@@ -2487,8 +2487,8 @@ def generate_html_report(output_dir, data, stats, chart_files):
         pos_stats['horizontal_peak'] = np.max(np.sqrt(east**2 + north**2))
         pos_stats['vertical_peak'] = np.max(np.abs(up))
 
-    # DOP statistics: prefer BESTDOPSA (manual-verified field order), fall back to GSA.
-    # Must stay consistent with the chart data source (bestdops_data if bestdops_data else gsa_data).
+    # DOP statistics: prefer GSA (only source that carries VDOP), fall back to BESTDOPSA (no VDOP).
+    # Must stay consistent with the chart data source (merge_gsa_dop_per_epoch(gsa_data) if gsa_data else bestdops_data).
     dop_stats = {'pdop': [0], 'hdop': [0], 'vdop': [0]}
     dop_src = None
     if 'gsa_data' in data and data['gsa_data']:
@@ -2740,7 +2740,15 @@ def generate_html_report(output_dir, data, stats, chart_files):
     # Add DOP Analysis Section
     pdop_stats = calc_statistics(dop_stats['pdop'])
     hdop_stats = calc_statistics(dop_stats['hdop'])
-    vdop_stats = calc_statistics(dop_stats['vdop'])
+    _vdop_vals = dop_stats['vdop']
+    vdop_stats = calc_statistics(_vdop_vals) if _vdop_vals and all(v is not None for v in _vdop_vals) else None
+    if vdop_stats:
+        vdop_row_html = ('<td>{:.2f}</td><td>{:.2f}</td><td>{:.2f}</td><td>{:.2f}</td><td>{:.2f}</td>'
+                         .format(vdop_stats['min'], vdop_stats['max'], vdop_stats['mean'],
+                                 vdop_stats['std'], vdop_stats['median']))
+    else:
+        vdop_row_html = ('<td colspan="5" style="text-align:center;color:#888;">'
+                         'N/A（VDOP 仅 GSA 提供，BESTDOPSA 无此字段）</td>')
 
     html_content += f"""
         <h2>3. DOP 分析</h2>
@@ -2779,11 +2787,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             </tr>
             <tr>
                 <td>VDOP</td>
-                <td>{vdop_stats['min']:.2f}</td>
-                <td>{vdop_stats['max']:.2f}</td>
-                <td>{vdop_stats['mean']:.2f}</td>
-                <td>{vdop_stats['std']:.2f}</td>
-                <td>{vdop_stats['median']:.2f}</td>
+                {vdop_row_html}
             </tr>
         </table>
     """
