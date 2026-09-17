@@ -34,14 +34,16 @@ python -X utf8 gps_rtk_analyzer_huace.py <输入数据文件> -o <输出目录>
 5. 对无时间戳、且手册未声明固定周期的报文（如 GSA / GSV），
    周期与均匀性标记为 **N/A（不可实测）**，不伪造统计值。
 
-## 不入库的内容
+## 仓库内容说明
 
-以下内容体积较大或属版权资料，已通过 `.gitignore` 排除，**不纳入版本管理**：
+本仓库除两套分析程序外，还包含：
 
-- `by_data/`、`huace_data/` —— 实测采集数据
-- `*_output/`、`*_report/` —— 程序生成的分析产物与报告
-- `by_manual/`、`huace_manual/`、`*.pdf` —— 厂商数据通信接口协议手册（版权资料）
-- `__pycache__/`、`.mypy_cache/` 等缓存
+- `by_data/`、`huace_data/` —— 实测采集数据（含各自 `*_output/` 分析产物与报告）
+- `by_manual/`、`huace_manual/` —— 厂商数据通信接口协议手册（PDF / Markdown / 图片，版权属原厂商，仅作内部参考）
+
+> 说明：上述数据与手册已纳入版本管理。其中两个文件超过 GitHub 建议的 50 MB 阈值（`by_data/_com3.dat` 约 77 MB、`huace_data/...COM11.log` 约 58 MB），推送时远程会提示 LFS 警告，但未超过 100 MB 硬上限，可正常存储。若后续需频繁更新大文件，建议改用 Git LFS 管理。
+
+`.gitignore` 当前仅排除 Python 缓存与系统/临时文件。
 
 ## 项目记忆
 
