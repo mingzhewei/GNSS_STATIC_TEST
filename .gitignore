@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# --- 测试数据与产物（体积大，不入库） ---
+by_data/
+huace_data/
+*_output/
+*_report/
+
+# --- 手册 PDF / 图片（体积大，且属版权资料） ---
+by_manual/
+huace_manual/
+*.pdf
+
+# --- 系统/编辑器 ---
+.DS_Store
+Thumbs.db
+_*.py
+_*.txt
