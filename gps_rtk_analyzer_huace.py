@@ -759,7 +759,7 @@ def parse_bestpa(lines):
             —— tow 为毫秒(idx7)，week 在 idx6（BESTPOSA 是 week idx5 / tow秒 idx6）。
       数据体(分号后)：sol_status, pos_type, datum_id, reserved, lat, lon, hgt,
             undulation, lat_sigma, lon_sigma, hgt_sigma, diff_age, sol_age,
-            #SVs, #solnSVs, #solnL1SVs, #solnMultiSVs, ext_sol_stat,
+            #SVs, #solnSVs, #solnMultiSVs, #solnL1SVs, ext_sol_stat,
             gps_glo_mask, bds_mask, gal_mask, reserved, stn_id, CRC
             —— lat/lon/hgt 在 idx4/5/6（BESTPOSA 在 idx2/3/4）。
 
@@ -801,8 +801,9 @@ def parse_bestpa(lines):
 
             num_svs = int(p_fields[13]) if len(p_fields) > 13 and p_fields[13] else 0
             num_soln_svs = int(p_fields[14]) if len(p_fields) > 14 and p_fields[14] else 0
-            num_soln_l1 = int(p_fields[15]) if len(p_fields) > 15 and p_fields[15] else 0
-            num_soln_multi = int(p_fields[16]) if len(p_fields) > 16 and p_fields[16] else 0
+            # 华测 BESTP 手册 V2.7 表3-38: Field17=#solnMultiSVs, Field18=#solnL1SVs (Multi在前)
+            num_soln_multi = int(p_fields[15]) if len(p_fields) > 15 and p_fields[15] else 0
+            num_soln_l1 = int(p_fields[16]) if len(p_fields) > 16 and p_fields[16] else 0
 
             if num_svs < 1 or num_svs > 99:
                 valid_fix = False
@@ -1931,26 +1932,6 @@ def _fmt_solution_dist(dist, enum_map):
     return "\n".join(lines)
 
 
-def chart_num_sats_gnss(gnss_data, output_dir):
-    """Plot number of satellites used."""
-    if not gnss_data:
-        return None
-
-    times = [r['tow'] for r in gnss_data]
-    num_sats = [r['num_svs'] for r in gnss_data]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(times, num_sats, 'b-', linewidth=2)
-    ax.set_xlabel('Time (s since start)')
-    ax.set_ylabel('Number of Satellites')
-    ax.set_title('Number of Satellites Used in Solution')
-    ax.grid(True, alpha=0.3)
-
-    filepath = output_dir / 'num_sats_ts.png'
-    plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
-    plt.close()
-    return filepath.name
-
 def chart_dop_timeseries(gsa_data, output_dir, gga_data=None):
     """Plot DOP time series."""
     if not gsa_data:
@@ -2196,11 +2177,11 @@ def chart_snr_distribution(gsv_data, output_dir):
     return filepath.name
 
 def chart_satellites_used_ts(gnss_data, output_dir):
-    """Plot #SVs and #solnSVs from BESTGNSSPOSA messages over time."""
+    """Plot #SVs (tracked) and #solnSVs (used in solution) over time."""
     if not gnss_data:
         return None
 
-    # Extract time and satellite counts from BESTGNSSPOSA data
+    # Extract time and satellite counts from BESTPA/BESTGNSSPOSA data
     times = [r['tow'] for r in gnss_data]
     num_svs = [r['num_svs'] for r in gnss_data]
     num_soln_svs = [r['num_soln_svs'] for r in gnss_data]
@@ -2213,7 +2194,7 @@ def chart_satellites_used_ts(gnss_data, output_dir):
 
     # Plot #SVs (total satellites tracked)
     ax.plot(times_normalized, num_svs, 'b-', linewidth=2, label='#SVs (Tracked)')
-    
+
     # Plot #solnSVs (satellites used in solution)
     ax.plot(times_normalized, num_soln_svs, 'r--', linewidth=2, label='#solnSVs (Used in Solution)')
 
@@ -2227,6 +2208,7 @@ def chart_satellites_used_ts(gnss_data, output_dir):
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
     plt.close()
     return filepath.name
+
 
 def chart_satellite_info(gsv_data, output_dir):
     """Create a table of satellite information."""
@@ -2459,7 +2441,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
     # Calculate position statistics if GNSS data is available
     pos_stats = {
         'east_std': 0, 'north_std': 0, 'up_std': 0,
-        'east_rms': 0, 'north_rms': 0, 'up_rms': 0,
+        'east_rms': 0, 'north_rms': 0, 'horizontal_rms': 0, 'up_rms': 0,
         'cep95': 0, 'drms': 0, 'horizontal_peak': 0, 'vertical_peak': 0
     }
 
@@ -2481,6 +2463,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
         pos_stats['up_std'] = np.std(up, ddof=1)
         pos_stats['east_rms'] = np.sqrt(np.mean(east**2))
         pos_stats['north_rms'] = np.sqrt(np.mean(north**2))
+        pos_stats['horizontal_rms'] = np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2)  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = np.sqrt(np.mean(up**2))
         pos_stats['cep95'] = calc_cep95(east, north)
         pos_stats['drms'] = calc_2drms(east, north)
@@ -2731,10 +2714,6 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <img src="data:image/png;base64,{encoded_images.get('solution_type_pie', '')}" alt="Solution Type Distribution"/>
         </div>
         <div class="dist-table">{_fmt_solution_dist_html(stats.get('sol_type_dist', {}), POS_TYPE_ENUM)}</div>
-
-        <div class="chart">
-            <img src="data:image/png;base64,{encoded_images.get('num_sats_ts', '')}" alt="Number of Satellites Used"/>
-        </div>
     """
 
     # Add DOP Analysis Section
@@ -2910,7 +2889,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             </tr>
             <tr>
                 <td>水平RMS</td>
-                <td>{(pos_stats['east_rms'] + pos_stats['north_rms'])/2:.4f} m</td>
+                <td>{pos_stats['horizontal_rms']:.4f} m</td>
                 <td>-</td>
                 <td>-</td>
             </tr>
@@ -2996,7 +2975,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <li><strong>注意事项:</strong>
                 <ul>
                     <li>CPE95为{pos_stats['cep95']*100:.1f}厘米，{'处于优秀水平' if pos_stats['cep95'] < 0.01 else '略高于理想值（<2cm），但仍属可接受范围' if not cep95_pass else '处于优秀水平'}</li>
-                    <li>垂直RMS({pos_stats['up_rms']*100:.1f}cm){'略高于' if pos_stats['up_rms'] > (pos_stats['east_rms'] + pos_stats['north_rms'])/2 else '与'}水平RMS({(pos_stats['east_rms'] + pos_stats['north_rms'])/2*100:.1f}cm)，这是静态测量的典型特征</li>
+                    <li>垂直RMS({pos_stats['up_rms']*100:.1f}cm){'略高于' if pos_stats['up_rms'] > pos_stats['horizontal_rms'] else '与'}水平RMS({pos_stats['horizontal_rms']*100:.1f}cm)，这是静态测量的典型特征</li>
                 </ul>
             </li>
             <li><strong>建议:</strong>
@@ -3022,7 +3001,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     """Generate Markdown report with image links."""
     # Position statistics on valid fixed solutions only (same source as HTML report).
     pos_stats = {'east_std': 0.0, 'north_std': 0.0, 'up_std': 0.0,
-                 'east_rms': 0.0, 'north_rms': 0.0, 'up_rms': 0.0,
+                 'east_rms': 0.0, 'north_rms': 0.0, 'horizontal_rms': 0.0, 'up_rms': 0.0,
                  'cep95': 0.0, 'drms': 0.0, 'horizontal_peak': 0.0, 'vertical_peak': 0.0}
     fix_rate = 0.0
     if 'gnss_data' in data and data['gnss_data']:
@@ -3041,6 +3020,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
         pos_stats['up_std'] = float(np.std(up, ddof=1))
         pos_stats['east_rms'] = float(np.sqrt(np.mean(east**2)))
         pos_stats['north_rms'] = float(np.sqrt(np.mean(north**2)))
+        pos_stats['horizontal_rms'] = float(np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2))  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = float(np.sqrt(np.mean(up**2)))
         pos_stats['cep95'] = float(calc_cep95(east, north))
         pos_stats['drms'] = float(calc_2drms(east, north))
@@ -3175,9 +3155,6 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 {_fmt_solution_dist(stats.get('sol_type_dist', {}), POS_TYPE_ENUM)}
 
-### 2.5 使用卫星数量
-![使用卫星数量](./num_sats_ts.png)
-
 ## 3. DOP分析
 
 ### 3.1 DOP时间序列
@@ -3237,7 +3214,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 |---------|------|---------|----------|
 | 固定解比例 | {fix_rate:.1f}% | >95% | {'✅ 通过' if fixrate_pass else '⚠️ 警告'} |
 | 位置CPE95 | {pos_stats['cep95']:.4f} m | <0.02 m | {cep95_eval} |
-| 水平RMS | {(pos_stats['east_rms'] + pos_stats['north_rms'])/2:.4f} m | - | - |
+| 水平RMS | {pos_stats['horizontal_rms']:.4f} m | - | - |
 | 垂直RMS | {pos_stats['up_rms']:.4f} m | - | - |
 | 固定解水平峰值 | {pos_stats['horizontal_peak']:.4f} m | - | - |
 | 固定解垂直峰值 | {pos_stats['vertical_peak']:.4f} m | - | - |
@@ -3505,8 +3482,6 @@ def cli_main():
     chart_files['en_scatter'] = chart_en_scatter(gnss_data, output_dir)
     chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_dir, gst_data)
     chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_dir)
-    chart_files['num_sats_ts'] = chart_num_sats_gnss(gnss_data, output_dir)
-
     # DOP analysis (BESTDOPSA preferred; GSA fallback keeps bynav-compatible behavior)
     # DOP 数据源: GSA 优先(含 VDOP; BESTDOPSA 无 VDOP 字段——手册3.2.12确认)。
     # 华测 GSA 每历元多条分星座但 DOP 相同，先按历元合并得到统一 PDOP/HDOP/VDOP。
@@ -4046,8 +4021,6 @@ class GPSAnalyzerGUI:
             chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_path, gst_data)
             self.log("  - 定位类型分布...", 'info')
             chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_path)
-            self.log("  - 使用卫星数量...", 'info')
-            chart_files['num_sats_ts'] = chart_num_sats_gnss(gnss_data, output_path)
 
             # DOP analysis (BESTDOPSA preferred, GSA fallback)
             dop_data = merge_gsa_dop_per_epoch(gsa_data) if gsa_data else bestdops_data

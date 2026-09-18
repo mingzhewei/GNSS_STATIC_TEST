@@ -1741,26 +1741,6 @@ def _fmt_solution_dist(dist, enum_map):
     return "\n".join(lines)
 
 
-def chart_num_sats_gnss(gnss_data, output_dir):
-    """Plot number of satellites used."""
-    if not gnss_data:
-        return None
-
-    times = [r['tow'] for r in gnss_data]
-    num_sats = [r['num_svs'] for r in gnss_data]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(times, num_sats, 'b-', linewidth=2)
-    ax.set_xlabel('Time (s since start)')
-    ax.set_ylabel('Number of Satellites')
-    ax.set_title('Number of Satellites Used in Solution')
-    ax.grid(True, alpha=0.3)
-
-    filepath = output_dir / 'num_sats_ts.png'
-    plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
-    plt.close()
-    return filepath.name
-
 def chart_dop_timeseries(gsa_data, output_dir, gga_data=None):
     """Plot DOP time series."""
     if not gsa_data:
@@ -2001,11 +1981,11 @@ def chart_snr_distribution(gsv_data, output_dir):
     return filepath.name
 
 def chart_satellites_used_ts(gnss_data, output_dir):
-    """Plot #SVs and #solnSVs from BESTGNSSPOSA messages over time."""
+    """Plot #SVs (tracked) and #solnSVs (used in solution) over time."""
     if not gnss_data:
         return None
 
-    # Extract time and satellite counts from BESTGNSSPOSA data
+    # Extract time and satellite counts from BESTPA/BESTGNSSPOSA data
     times = [r['tow'] for r in gnss_data]
     num_svs = [r['num_svs'] for r in gnss_data]
     num_soln_svs = [r['num_soln_svs'] for r in gnss_data]
@@ -2018,7 +1998,7 @@ def chart_satellites_used_ts(gnss_data, output_dir):
 
     # Plot #SVs (total satellites tracked)
     ax.plot(times_normalized, num_svs, 'b-', linewidth=2, label='#SVs (Tracked)')
-    
+
     # Plot #solnSVs (satellites used in solution)
     ax.plot(times_normalized, num_soln_svs, 'r--', linewidth=2, label='#solnSVs (Used in Solution)')
 
@@ -2032,6 +2012,7 @@ def chart_satellites_used_ts(gnss_data, output_dir):
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
     plt.close()
     return filepath.name
+
 
 def chart_satellite_info(gsv_data, output_dir):
     """Create a table of satellite information."""
@@ -2109,7 +2090,9 @@ def chart_ins_vs_gnss_position(ins_data, gnss_data, output_dir):
     dlat = [i['lat'] - g['lat'] for i, g in matched]
     dlon = [i['lon'] - g['lon'] for i, g in matched]
     dhgt = [i['hgt'] - g['hgt'] for i, g in matched]
-    times = [g['tow'] for _, g in matched]
+    # 时间轴归一化：以 INS 首个历元为 0 点（秒），与 pos_timeseries 等 GNSS 图保持一致
+    _t0 = ins_data[0]['tow']
+    times = [g['tow'] - _t0 for _, g in matched]
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
     fig.suptitle('INS vs GNSS Position Offset', fontsize=14)
@@ -2139,7 +2122,9 @@ def chart_ins_attitude(ins_data, output_dir):
     if not ins_data:
         return None
 
-    times = [r['tow'] for r in ins_data]
+    # 时间轴归一化：以首个 INS 历元为 0 点（秒），与 GNSS 图时间基准一致
+    _t0 = ins_data[0]['tow']
+    times = [r['tow'] - _t0 for r in ins_data]
     rolls = [r['roll'] for r in ins_data]
     pitches = [r['pitch'] for r in ins_data]
     azimuths = [r['azimuth'] for r in ins_data]
@@ -2173,7 +2158,9 @@ def chart_ins_velocity(ins_data, output_dir):
     if not ins_data:
         return None
 
-    times = [r['tow'] for r in ins_data]
+    # 时间轴归一化：以首个 INS 历元为 0 点（秒），与 GNSS 图时间基准一致
+    _t0 = ins_data[0]['tow']
+    times = [r['tow'] - _t0 for r in ins_data]
     north_vels = [r['north_vel'] for r in ins_data]
     east_vels = [r['east_vel'] for r in ins_data]
     up_vels = [r['up_vel'] for r in ins_data]
@@ -2207,7 +2194,9 @@ def chart_ins_attitude_sigma(ins_data, output_dir):
     if not ins_data:
         return None
 
-    times = [r['tow'] for r in ins_data]
+    # 时间轴归一化：以首个 INS 历元为 0 点（秒），与 GNSS 图时间基准一致
+    _t0 = ins_data[0]['tow']
+    times = [r['tow'] - _t0 for r in ins_data]
     roll_sigmas = [r['roll_sigma'] for r in ins_data]
     pitch_sigmas = [r['pitch_sigma'] for r in ins_data]
     azimuth_sigmas = [r['azimuth_sigma'] for r in ins_data]
@@ -2371,6 +2360,12 @@ def chart_data_gaps(gaps, output_dir):
     else:
         fig, ax = plt.subplots(figsize=(12, 4))
 
+        # 时间轴归一化：原始 gap 坐标为 GPS 周内秒(3e5量级)，平移到“距起点秒数”
+        _t0 = min(gap['start_time'] for gap in gaps)
+        gaps = [{**gap,
+                 'start_time': gap['start_time'] - _t0,
+                 'end_time': gap['end_time'] - _t0} for gap in gaps]
+
         # Timeline
         timeline = [0]
         for gap in gaps:
@@ -2516,7 +2511,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
     # Calculate position statistics if GNSS data is available
     pos_stats = {
         'east_std': 0, 'north_std': 0, 'up_std': 0,
-        'east_rms': 0, 'north_rms': 0, 'up_rms': 0,
+        'east_rms': 0, 'north_rms': 0, 'horizontal_rms': 0, 'up_rms': 0,
         'cep95': 0, 'drms': 0, 'horizontal_peak': 0, 'vertical_peak': 0
     }
 
@@ -2537,6 +2532,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
         pos_stats['up_std'] = np.std(up, ddof=1)
         pos_stats['east_rms'] = np.sqrt(np.mean(east**2))
         pos_stats['north_rms'] = np.sqrt(np.mean(north**2))
+        pos_stats['horizontal_rms'] = np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2)  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = np.sqrt(np.mean(up**2))
         pos_stats['cep95'] = calc_cep95(east, north)
         pos_stats['drms'] = calc_2drms(east, north)
@@ -2781,10 +2777,6 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <img src="data:image/png;base64,{encoded_images.get('solution_type_pie', '')}" alt="Solution Type Distribution"/>
         </div>
         <div class="dist-table">{_fmt_solution_dist_html(stats.get('sol_type_dist', {}), POS_TYPE_ENUM)}</div>
-
-        <div class="chart">
-            <img src="data:image/png;base64,{encoded_images.get('num_sats_ts', '')}" alt="Number of Satellites Used"/>
-        </div>
     """
 
     # Add DOP Analysis Section
@@ -2965,7 +2957,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             </tr>
             <tr>
                 <td>水平RMS</td>
-                <td>{(pos_stats['east_rms'] + pos_stats['north_rms'])/2:.4f} m</td>
+                <td>{pos_stats['horizontal_rms']:.4f} m</td>
                 <td>-</td>
                 <td>-</td>
             </tr>
@@ -3057,7 +3049,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <li><strong>注意事项:</strong>
                 <ul>
                     <li>CPE95为{pos_stats['cep95']*100:.1f}厘米，{'处于优秀水平' if pos_stats['cep95'] < 0.01 else '略高于理想值（<2cm），但仍属可接受范围' if not cep95_pass else '处于优秀水平'}</li>
-                    <li>垂直RMS({pos_stats['up_rms']*100:.1f}cm){'略高于' if pos_stats['up_rms'] > (pos_stats['east_rms'] + pos_stats['north_rms'])/2 else '与'}水平RMS({(pos_stats['east_rms'] + pos_stats['north_rms'])/2*100:.1f}cm)，这是静态测量的典型特征</li>
+                    <li>垂直RMS({pos_stats['up_rms']*100:.1f}cm){'略高于' if pos_stats['up_rms'] > pos_stats['horizontal_rms'] else '与'}水平RMS({pos_stats['horizontal_rms']*100:.1f}cm)，这是静态测量的典型特征</li>
                 </ul>
             </li>
             <li><strong>建议:</strong>
@@ -3083,7 +3075,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     """Generate Markdown report with image links."""
     # Position statistics on valid fixed solutions (same source as HTML report & 华测 MD).
     pos_stats = {'east_std': 0.0, 'north_std': 0.0, 'up_std': 0.0,
-                 'east_rms': 0.0, 'north_rms': 0.0, 'up_rms': 0.0,
+                 'east_rms': 0.0, 'north_rms': 0.0, 'horizontal_rms': 0.0, 'up_rms': 0.0,
                  'cep95': 0.0, 'drms': 0.0, 'horizontal_peak': 0.0, 'vertical_peak': 0.0}
     fix_rate = 0.0
     if 'gnss_data' in data and data['gnss_data']:
@@ -3102,6 +3094,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
         pos_stats['up_std'] = float(np.std(up, ddof=1))
         pos_stats['east_rms'] = float(np.sqrt(np.mean(east**2)))
         pos_stats['north_rms'] = float(np.sqrt(np.mean(north**2)))
+        pos_stats['horizontal_rms'] = float(np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2))  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = float(np.sqrt(np.mean(up**2)))
         pos_stats['cep95'] = float(calc_cep95(east, north))
         pos_stats['drms'] = float(calc_2drms(east, north))
@@ -3206,9 +3199,6 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 {_fmt_solution_dist(stats.get('sol_type_dist', {}), POS_TYPE_ENUM)}
 
-### 2.5 使用卫星数量
-![使用卫星数量](./num_sats_ts.png)
-
 ## 3. DOP分析
 
 ### 3.1 DOP时间序列
@@ -3292,7 +3282,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 |---------|------|---------|----------|
 | 固定解比例 | {fix_rate:.1f}% | >95% | {'✅ 通过' if fix_rate>95 else '⚠️ 偏低'} |
 | 位置CPE95 | {pos_stats['cep95']:.3f} m | <{RTK_STANDARDS['cep95_rtk_fixed']:.2f} m | {'✅ 通过' if pos_stats['cep95']<=RTK_STANDARDS['cep95_rtk_fixed'] else '⚠️ 警告'} |
-| 水平RMS | {(pos_stats['east_rms']+pos_stats['north_rms'])/2:.3f} m | - | - |
+| 水平RMS | {pos_stats['horizontal_rms']:.3f} m | - | - |
 | 垂直RMS | {pos_stats['up_rms']:.3f} m | - | - |
 | 固定解水平峰值 | {pos_stats['horizontal_peak']:.3f} m | - | - |
 | 固定解垂直峰值 | {pos_stats['vertical_peak']:.3f} m | - | - |
@@ -3470,9 +3460,10 @@ def cli_main():
         # Calculate actual sampling interval from GGA data
         gga_times = [r['time_seconds'] for r in gga_data]
         actual_interval = np.mean(np.diff(gga_times))
-        expected_count = int(stats['duration'] / actual_interval)
+        # 分母对 5Hz 标称(北云 GGA 5Hz)，避免用 actual_interval 反推导致丢帧被掩盖(实测丢30帧仍算100%)
+        expected_count = int(stats['duration'] * 5) + 1
         actual_count = len(gga_data)
-        stats['data_completeness'] = (actual_count / expected_count * 100) if expected_count > 0 else 100.0
+        stats['data_completeness'] = min(100.0, (actual_count / expected_count * 100) if expected_count > 0 else 100.0)
         stats['sampling_interval'] = actual_interval
     else:
         stats['data_completeness'] = 0.0
@@ -3539,8 +3530,6 @@ def cli_main():
     chart_files['en_scatter'] = chart_en_scatter(gnss_data, output_dir)
     chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_dir)
     chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_dir)
-    chart_files['num_sats_ts'] = chart_num_sats_gnss(gnss_data, output_dir)
-
     # DOP analysis
     chart_files['dop_timeseries'] = chart_dop_timeseries(gsa_data, output_dir, gga_data)
     chart_files['dop_histogram'] = chart_dop_histogram(gsa_data, output_dir)
@@ -4016,9 +4005,10 @@ class GPSAnalyzerGUI:
             if stats['duration'] > 0 and gga_data and len(gga_data) > 1:
                 gga_times = [r['time_seconds'] for r in gga_data]
                 actual_interval = np.mean(np.diff(gga_times))
-                expected_count = int(stats['duration'] / actual_interval)
+                # 分母对 5Hz 标称(北云 GGA 5Hz)，避免用 actual_interval 反推导致丢帧被掩盖(实测丢30帧仍算100%)
+                expected_count = int(stats['duration'] * 5) + 1
                 actual_count = len(gga_data)
-                stats['data_completeness'] = (actual_count / expected_count * 100) if expected_count > 0 else 100.0
+                stats['data_completeness'] = min(100.0, (actual_count / expected_count * 100) if expected_count > 0 else 100.0)
             else:
                 stats['data_completeness'] = 0.0
 
@@ -4091,8 +4081,6 @@ class GPSAnalyzerGUI:
             chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_path)
             self.log("  - 定位类型分布...", 'info')
             chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_path)
-            self.log("  - 使用卫星数量...", 'info')
-            chart_files['num_sats_ts'] = chart_num_sats_gnss(gnss_data, output_path)
 
             # DOP analysis
             self.log("  - DOP时间序列...", 'info')
