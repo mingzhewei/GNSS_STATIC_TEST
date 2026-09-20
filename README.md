@@ -10,6 +10,7 @@
 |------|------|----------|------|
 | `gps_rtk_analyzer_bynav.py` | 北云 | ICOM3 中的 **BESTGNSSPOSA**（纯 GNSS）+ **INSPVAXA**（惯导） | 仅分析 COM3；COM4 为二进制流，仅作提示 |
 | `gps_rtk_analyzer_huace.py` | 华测 | COM1 中的 **BESTPA**（10 Hz 主数据，BESTPOSA 兜底） | — |
+| `gnss_static_hmi.py` | 统一 HMI | 调用上表产品分析脚本 | 产品选择、后台运行、自动打开 HTML 报告 |
 
 ## 使用方式
 
@@ -22,6 +23,16 @@ python -X utf8 gps_rtk_analyzer_huace.py <输入数据文件> -o <输出目录>
 ```
 
 两套程序均带 GUI（直接运行不带参数即进入界面），并生成 HTML / Markdown 报告。
+
+统一产品选择入口：
+
+```bash
+python -X utf8 gnss_static_hmi.py
+```
+
+`GNSS Static HMI` 仅作为 HMI/启动器，不包含产品解析逻辑。新增产品时，在
+`gnss_static_hmi.py` 的 `PRODUCTS` 注册表中增加一条 `ProductConfig`，指向新的
+产品分析脚本；新脚本需兼容 CLI 调用并在输出目录生成 `report.html`。
 
 ## 核心准则
 
