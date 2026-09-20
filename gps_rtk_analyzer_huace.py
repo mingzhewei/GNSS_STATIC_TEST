@@ -1407,7 +1407,7 @@ def assess_static_stability(gnss_data):
         'is_static': is_static,
     }
 
-# === 静态质量评估扩展（行业标准静态流程；字段注释见各函数 docstring） ===
+# === 静态质量评估扩展（工程评估流程；字段注释见各函数 docstring） ===
 
 def summarize_sigma_convergence(gnss_data):
     """定位标准差(sigma)收敛评估 —— 用于判断 RTK 解的收敛情况与定位精度。
@@ -1511,7 +1511,7 @@ def summarize_snr(gsv_data):
 
     字段来源：GSV 报文中每颗可见星的 SNR（dBHz）。
     判断什么：整体信号接收条件好坏。
-    怎样好：平均 C/N0 >= 38 dBHz（开阔地，行业常用分级）。
+    怎样好：平均 C/N0 >= 38 dBHz（开阔地，工程经验分级）。
     怎样坏：平均 C/N0 32~37（半遮挡）、<= 31（严重遮挡）；低仰角星 C/N0 普遍偏低属正常。
     返回：全部卫星 SNR 的均值/最小/最大/分布，以及各星座均值。
     """
@@ -2960,7 +2960,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <tr>
                 <th>评估指标</th>
                 <th>数值</th>
-                <th>行业标准</th>
+                <th>工程阈值</th>
                 <th>评估结果</th>
             </tr>
             <tr>
@@ -3061,9 +3061,9 @@ def generate_html_report(output_dir, data, stats, chart_files):
             <li><strong>优点:</strong>
                 <ul>
                     <li>{fix_rate:.1f}%固定解比例，{'完全满足' if fix_rate >= 95 else '基本满足'}RTK定位要求</li>
-                    <li>PDOP和HDOP值{'远低于' if pdop_stats['mean'] <= 1.5 else '低于'}行业阈值，卫星几何构型{'优秀' if pdop_stats['mean'] <= 1.5 else '良好'}</li>
+                    <li>PDOP和HDOP值{'远低于' if pdop_stats['mean'] <= 1.5 else '低于'}工程阈值，卫星几何构型{'优秀' if pdop_stats['mean'] <= 1.5 else '良好'}</li>
                     <li>数据完整性达{stats.get('data_completeness', 0):.1f}%，{'无' if stats.get('data_gaps', 0) == 0 else '存在'}数据间隙</li>
-                    <li>R95为{pos_stats['r95']*100:.1f}厘米，{'达到' if r95_pass else '未达到'}行业标准</li>
+                    <li>R95为{pos_stats['r95']*100:.1f}厘米，{'达到' if r95_pass else '未达到'}工程阈值</li>
                 </ul>
             </li>
             <li><strong>注意事项:</strong>
@@ -3309,7 +3309,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 {ENV_MD_ROWS}
 ## 6. 质量评估表
 
-| 评估指标 | 数值 | 行业标准 | 评估结果 |
+| 评估指标 | 数值 | 工程阈值 | 评估结果 |
 |---------|------|---------|----------|
 | 固定解比例 | {fix_rate:.1f}% | >95% | {'✅ 通过' if fixrate_pass else '⚠️ 警告'} |
 | 位置R95 | {pos_stats['r95']:.4f} m | <0.02 m | {r95_eval} |
@@ -3333,12 +3333,12 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 ### 优点
 - {fix_rate:.1f}%固定解比例{'，完全满足RTK定位要求' if fixrate_pass else '，未达到95%要求'}
-- PDOP和HDOP值{'远低于' if dop_s['pdop']['mean'] < 3.0 else '接近'}行业阈值，卫星几何构型{'优秀' if dop_s['pdop']['mean'] < 3.0 else '一般'}
+- PDOP和HDOP值{'远低于' if dop_s['pdop']['mean'] < 3.0 else '接近'}工程阈值，卫星几何构型{'优秀' if dop_s['pdop']['mean'] < 3.0 else '一般'}
 - 数据完整性达{stats['data_completeness']:.1f}%，{'无数据间隙' if stats['data_gaps'] == 0 else '存在数据间隙'}
 - 接收机位置稳定，观测环境良好
 
 ### 注意事项
-- R95为{pos_stats['r95']*100:.1f}厘米，{'达到行业标准（<2cm）' if r95_pass else '略高于理想值（<2cm），但仍属可接受范围'}
+- R95为{pos_stats['r95']*100:.1f}厘米，{'达到工程阈值（<2cm）' if r95_pass else '略高于理想值（<2cm），但仍属可接受范围'}
 - 垂直RMS略高于水平RMS，这是静态测量的典型特征
 
 ### 建议
