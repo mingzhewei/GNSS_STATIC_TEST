@@ -1436,12 +1436,58 @@ def summarize_sigma_convergence(gnss_data):
         'v_mean': float(np.mean(vs)), 'v_max': float(np.max(vs)),
     }
 
-def summarize_gst_rms_convergence(gst_data):
-    """华测专属：基于 GNGST 伪距残差 RMS 的收敛评估（替代恒定的位置sigma）。
+def summarize_position_sigma_convergence(gnss_data, gst_data=None):
+    """位置标准差(sigma)收敛评估——华测数据源优先级：位置报文 sigma 优先，GNGST 兜底。
 
-    字段来源：GNGST 的 rms（伪距残差 RMS, m）——M720 唯一逐历元变化的精度量。
-    判断什么：rms 由大变小并趋于稳定 = 解收敛良好；rms 尖峰 = 失锁/重收敛。
-    与北云 summarize_sigma_convergence 返回结构一致，供报告同一模板渲染。
+    依据（华测 M7 手册 V2.7）：
+      - BESTP/BESTPOS 的 lat/lon/hgt sigma = 纬度/经度/高度标准差（§3.2.14
+        表3-38 Field10-12，单位 m），是接收机解算协方差的直接输出。
+      - GNGST 的 latstd/lonstd/altstd 同样是位置标准差（§3.1.5 表3-9
+        Field7-9），同历元数值与位置报文一致，但仅 3 位小数；GNGST 的 rms
+        字段是“伪距/DGNSS 修正值标准偏差的均方根”（表3-9 Field3），属
+        观测量残差统计，不是位置标准差，**不用于**本评估。
+    返回结构与北云 summarize_sigma_convergence 一致，供报告同一模板渲染。
+    """
+    if gnss_data:
+        rows = sorted(gnss_data, key=lambda r: r['tow'])
+        valid = [r for r in rows if r.get('lat_sigma') is not None and r.get('lat_sigma', 0) > 0]
+        if not valid:
+            return {}
+        t = [r['tow'] for r in valid]
+        hs = [float(np.hypot(r['lat_sigma'], r['lon_sigma'])) for r in valid]
+        vs = [float(r['hgt_sigma']) for r in valid]
+        src = 'BESTPA'
+    elif gst_data:
+        rows = sorted(gst_data, key=lambda r: r['time_seconds'])
+        valid = [r for r in rows if r.get('lat_sigma') is not None and r['lat_sigma'] > 0]
+        if not valid:
+            return {}
+        t = [r['time_seconds'] for r in valid]
+        hs = [float(np.hypot(r['lat_sigma'], r['lon_sigma'])) for r in valid]
+        vs = [float(r['alt_sigma']) for r in valid]
+        src = 'GNGST'
+    else:
+        return {}
+    k = max(1, len(valid) // 20)  # 前/后 5% 作为初值/末值
+    return {
+        'source': src,
+        'times': t, 'h_sigma': hs, 'v_sigma': vs,
+        'h_init': float(np.mean(hs[:k])), 'h_final': float(np.mean(hs[-k:])),
+        'h_mean': float(np.mean(hs)), 'h_max': float(np.max(hs)),
+        'v_init': float(np.mean(vs[:k])), 'v_final': float(np.mean(vs[-k:])),
+        'v_mean': float(np.mean(vs)), 'v_max': float(np.max(vs)),
+    }
+
+
+def summarize_pseudorange_residual(gst_data):
+    """伪距残差(测距域)统计 —— 评估观测量的噪声/多径健康度，与位置σ(定位域)互补。
+
+    字段来源：GNGST 的 rms（手册 3.1.5 表3-9 Field3：伪距、DGNSS修正值的标准
+    偏差的均方根，单位 m）。这是“测距域”物理量——每颗星距离测量噪声的综合，
+    与 BESTPA 位置σ（“定位域”，解算协方差的坐标不确定度）是定位链路两端、
+    不可互相替代。多径/遮挡首先使 rms 冲尖峰（早警器）；位置σ经几何放大
+    (σ≈DOP×σ_range)，反映坐标可信度。
+    返回：rms 的初/末/均值/最大值/时间序列（供绘图与报告）。
     """
     if not gst_data:
         return {}
@@ -1450,17 +1496,13 @@ def summarize_gst_rms_convergence(gst_data):
     if not valid:
         return {}
     t = [r['time_seconds'] for r in valid]
-    hs = [float(r['rms']) for r in valid]  # 用伪距残差RMS充当水平精度趋势量
-    vs = [float(r['major_sigma']) if r.get('major_sigma') is not None else float('nan') for r in valid]
+    rv = [float(r['rms']) for r in valid]
     k = max(1, len(valid) // 20)
-    import math
-    vs_clean = [v for v in vs if not math.isnan(v)] or [0.0]
     return {
-        'times': t, 'h_sigma': hs, 'v_sigma': vs,
-        'h_init': float(np.mean(hs[:k])), 'h_final': float(np.mean(hs[-k:])),
-        'h_mean': float(np.mean(hs)), 'h_max': float(np.max(hs)),
-        'v_init': float(np.mean(vs_clean[:k])), 'v_final': float(np.mean(vs_clean[-k:])),
-        'v_mean': float(np.mean(vs_clean)), 'v_max': float(np.max(vs_clean)),
+        'source': 'GNGST',
+        'times': t, 'rms': rv,
+        'init': float(np.mean(rv[:k])), 'final': float(np.mean(rv[-k:])),
+        'mean': float(np.mean(rv)), 'max': float(np.max(rv)), 'min': float(np.min(rv)),
     }
 
 
@@ -1807,77 +1849,118 @@ def chart_en_scatter(gnss_data, output_dir):
     return filepath.name, {'sigma_u': sigma_u}
 
 def chart_position_sigma(gnss_data, output_dir, gst_data=None):
-    """绘制定位精度(sigma)时间序列。
+    """绘制位置标准差(sigma)时间序列。
 
-    华测 M720 特性(数据为准)：位置报文(BESTPOSA/BESTPA)的 lat/lon/hgt_sigma
-    全程为接收机恒定输出，不随解质量逐历元更新(实测恒为定值)，故不能反映
-    收敛/失锁。真正逐历元变化的动态精度量在 GNGST：
-        rms        = 伪距残差 RMS(m)，失锁/重收敛时冲高；
-        major/minor= 误差椭圆半长/半短轴(m)。
-    本图以 GNGST 动态量为主轴；位置sigma作为参考平线叠加，并在标题注明其恒定性。
+    数据源优先级（依据华测 M7 手册 V2.7 与实测数据）：
+      1) 位置报文 #BESTPA / #BESTPOSA 的 lat/lon/hgt sigma（手册 3.2.14 表3-38
+         Field10/11/12：纬度/经度/高度标准差，单位 m）——接收机解算协方差的
+         直接输出，是定位精度的权威指标。
+      2) 无位置报文时退回 $GNGST（手册 3.1.5 表3-9：伪距误差信息；字段 7-9
+         的 latstd/lonstd/altstd 为位置标准差，但仅保留 3 位小数，精度低于
+         BESTPA 的 4 位小数）。
+    注意：两者物理量一致（实测同历元最大偏差 <= GNGST 的 0.001m 量化步长），
+    但 GNGST 的 rms 字段是“伪距/DGNSS 修正值标准偏差的均方根”，属观测量
+    残差统计，**不是**位置标准差，不能互相替代（手册 3.1.5 表3-9 Field3）。
     """
     if not gnss_data and not gst_data:
         return None
 
+    # 逐历元判定 BESTPA 位置σ是否为接收机恒定输出（如 M720 部分固件在差分
+    # 过渡态下全程输出定值）。恒定则该量无趋势信息，退回 GNGST 画图，
+    # 收敛评估侧仍返回 sigma 均值/极差供报告参考（数值本身并非无效）。
+    def _is_constant_sigma(data):
+        vals = {(r['lat_sigma'], r['lon_sigma'], r['hgt_sigma']) for r in data}
+        return len(vals) == 1
+
+    use_gnss_sigma = bool(gnss_data) and not _is_constant_sigma(gnss_data)
+
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-    fig.suptitle('Position Accuracy (GNGST dynamic; BESTPOSA position σ constant & unused)', fontsize=13)
 
-    if gst_data:
-        t0 = gst_data[0]['time_seconds']
-        gt = [r['time_seconds'] - t0 for r in gst_data]
-        rms = [r['rms'] for r in gst_data]
-        major = [r['major_sigma'] if r['major_sigma'] is not None else float('nan') for r in gst_data]
-        minor = [r['minor_sigma'] if r['minor_sigma'] is not None else float('nan') for r in gst_data]
-
-        axes[0].plot(gt, rms, 'b-', linewidth=1, label='Pseudorange residual RMS')
-        axes[0].set_ylabel('RMS residual (m)')
-        axes[0].set_title('GNGST Pseudorange Residual RMS')
-        axes[0].legend(); axes[0].grid(True, alpha=0.3)
-
-        axes[1].plot(gt, major, 'g-', linewidth=1, label='Error ellipse major axis')
-        axes[1].set_ylabel('Major σ (m)')
-        axes[1].set_title('GNGST Error Ellipse Major Axis')
-        axes[1].legend(); axes[1].grid(True, alpha=0.3)
-
-        axes[2].plot(gt, minor, 'r-', linewidth=1, label='Error ellipse minor axis')
-        axes[2].set_ylabel('Minor σ (m)')
-        axes[2].set_title('GNGST Error Ellipse Minor Axis')
-        axes[2].legend(); axes[2].grid(True, alpha=0.3)
-
-        # 说明BESTPOSA位置σ为恒定输出（不随解质量逐历元更新），仅作文字注释，
-        # 不再叠加其9.59m参考线——否则会把0.002~0.011m的动态量压到Y轴底部看成直线。
-        if gnss_data:
-            ls = gnss_data[0]
-            const_note = (f"BESTPOSA lat/lon/hgt σ constant = "
-                          f"{ls.get('lat_sigma',0):.4f}/{ls.get('lon_sigma',0):.4f}/"
-                          f"{ls.get('hgt_sigma',0):.4f} m (receiver fixed, unused)")
-            axes[0].text(0.01, 0.95, const_note, transform=axes[0].transAxes,
-                         fontsize=8, va='top', color='dimgray')
-        # 各动态量子图按自身数据量程自适应，并留10%边距，保证逐历元波动清晰可见
-        for ax in axes:
-            ax.margins(y=0.1)
-            ax.relim()
-            ax.autoscale_view(scalex=False, scaley=True)
-    else:
-        # 无 GST：退回画位置sigma（可能恒定），并注明
+    if use_gnss_sigma:
+        fig.suptitle('Position Sigma Time Series (BESTPA, CHCNAV M7 Manual Sec.3.2.14 Field10-12)', fontsize=13)
         times = [r['tow'] for r in gnss_data]
         t0 = times[0] if times else 0
         tn = [t - t0 for t in times]
         axes[0].plot(tn, [r['lat_sigma'] for r in gnss_data], 'b-', linewidth=1)
-        axes[0].set_ylabel('Latitude σ (m)'); axes[0].grid(True, alpha=0.3)
-        axes[0].set_title('BESTPOSA Position σ (receiver constant output)')
+        axes[0].set_ylabel('Latitude sigma (m)'); axes[0].grid(True, alpha=0.3)
+        axes[0].set_title('Latitude sigma (BESTPA Field10)')
         axes[1].plot(tn, [r['lon_sigma'] for r in gnss_data], 'g-', linewidth=1)
-        axes[1].set_ylabel('Longitude σ (m)'); axes[1].grid(True, alpha=0.3)
+        axes[1].set_ylabel('Longitude sigma (m)'); axes[1].grid(True, alpha=0.3)
+        axes[1].set_title('Longitude sigma (BESTPA Field11)')
         axes[2].plot(tn, [r['hgt_sigma'] for r in gnss_data], 'r-', linewidth=1)
-        axes[2].set_ylabel('Height σ (m)'); axes[2].grid(True, alpha=0.3)
+        axes[2].set_ylabel('Height sigma (m)'); axes[2].grid(True, alpha=0.3)
+        axes[2].set_title('Height sigma (BESTPA Field12)')
+        axes[2].set_xlabel('Time (s since start)')
+        # 测距域残差RMS 已拆到独立图 pseudorange_residual_ts.png，不与此图混叠
+    else:
+        # 无位置报文，或位置报文σ为接收机恒定输出：退回 GNGST 位置标准差字段
+        # （3 位小数量化，并附伪距残差RMS供参考）
+        if gnss_data:
+            r0 = gnss_data[0]
+            reason = (f"BESTPA position sigma constant = {r0['lat_sigma']:.4f}/{r0['lon_sigma']:.4f}/"
+                      f"{r0['hgt_sigma']:.4f} m (receiver fixed output, no per-epoch trend)")
+        else:
+            reason = "no BESTPA/BESTPOSA records in log"
+        fig.suptitle(f'Position Sigma Time Series (GNGST fallback, CHCNAV M7 Manual Sec.3.1.5)\n{reason}', fontsize=12)
+        t0 = gst_data[0]['time_seconds']
+        gt = [r['time_seconds'] - t0 for r in gst_data]
+        lat = [r['lat_sigma'] if r['lat_sigma'] is not None else float('nan') for r in gst_data]
+        lon = [r['lon_sigma'] if r['lon_sigma'] is not None else float('nan') for r in gst_data]
+        alt = [r['alt_sigma'] if r['alt_sigma'] is not None else float('nan') for r in gst_data]
+        axes[0].plot(gt, lat, 'b-', linewidth=1)
+        axes[0].set_ylabel('Latitude sigma (m)'); axes[0].grid(True, alpha=0.3)
+        axes[0].set_title('GNGST latstd (Field7)')
+        axes[1].plot(gt, lon, 'g-', linewidth=1)
+        axes[1].set_ylabel('Longitude sigma (m)'); axes[1].grid(True, alpha=0.3)
+        axes[1].set_title('GNGST lonstd (Field8)')
+        axes[2].plot(gt, alt, 'r-', linewidth=1, label='GNGST altstd (Field9)')
+        rms = [r['rms'] for r in gst_data]
+        ax2 = axes[2].twinx()
+        ax2.plot(gt, rms, color='gray', linewidth=0.8, alpha=0.6, label='GNGST pseudorange residual RMS (Field3)')
+        ax2.set_ylabel('Residual RMS (m)')
+        axes[2].set_ylabel('Height sigma (m)'); axes[2].grid(True, alpha=0.3)
+        axes[2].set_title('GNGST altstd + Pseudorange Residual RMS (reference only, not position sigma)')
+        axes[2].set_xlabel('Time (s since start)')
+        h1, l1 = axes[2].get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        axes[2].legend(h1 + h2, l1 + l2, fontsize=8, loc='upper right')
 
-    axes[2].set_xlabel('Time (s since start)')
     plt.tight_layout()
 
     filepath = output_dir / 'position_sigma_ts.png'
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
     plt.close()
     return filepath.name
+
+def chart_pseudorange_residual(gst_data, output_dir):
+    """伪距残差RMS时间序列（测距域）——独立于位置σ图，避免双y轴误导。
+
+    字段：GNGST 的 rms（手册 3.1.5 表3-9 Field3：伪距/DGNSS修正值标准偏差的
+    均方根，m）。测距域物理量，多径/遮挡早警器；与定位域位置σ分图呈现。
+    """
+    if not gst_data:
+        return None
+    rows = sorted(gst_data, key=lambda r: r['time_seconds'])
+    t0 = rows[0]['time_seconds']
+    t = [r['time_seconds'] - t0 for r in rows]
+    rms = [r['rms'] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.plot(t, rms, color='darkorange', linewidth=1, label='GNGST pseudorange residual RMS (Field3)')
+    ax.set_ylabel('Residual RMS (m)')
+    ax.set_xlabel('Time (s since start)')
+    ax.set_title('Pseudorange Residual RMS — Ranging Domain (GNGST, CHCNAV M7 Manual Sec.3.1.5)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    ax.margins(y=0.1)
+    plt.tight_layout()
+
+    filepath = output_dir / 'pseudorange_residual_ts.png'
+    plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
+    plt.close()
+    return filepath.name
+
+
 def chart_solution_type_pie(gnss_data, output_dir):
     """绘制定位类型(pos_type)分布饼图，并返回分布统计。
 
@@ -1899,7 +1982,7 @@ def chart_solution_type_pie(gnss_data, output_dir):
 
     fig, ax = plt.subplots(figsize=(9, 8))
     ax.pie(counts.values(), labels=labels, autopct='%1.1f%%', startangle=90)
-    ax.set_title('Solution Type Distribution (BESTPOSA/BESTGNSSPOSA)')
+    ax.set_title('Solution Type Distribution (Position Source)')
 
     filepath = output_dir / 'solution_type_pie.png'
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
@@ -2656,7 +2739,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
 
     # Add GNSS Analysis Section
     html_content += f"""
-        <h2>2. GNSS 定位分析 (BESTGNSSPOSA)</h2>
+        <h2>2. GNSS 定位分析 (BESTPA)</h2>
         <div class="chart">
             <img src="data:image/png;base64,{encoded_images.get('pos_timeseries', '')}" alt="Position Time Series"/>
         </div>
@@ -2708,6 +2791,10 @@ def generate_html_report(output_dir, data, stats, chart_files):
 
         <div class="chart">
             <img src="data:image/png;base64,{encoded_images.get('position_sigma_ts', '')}" alt="Position Sigma Time Series"/>
+        </div>
+
+        <div class="chart">
+            <img src="data:image/png;base64,{encoded_images.get('pseudorange_residual_ts', '')}" alt="Pseudorange Residual RMS Time Series"/>
         </div>
 
         <div class="chart">
@@ -2822,6 +2909,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
     _fc = stats.get('fix_continuity', {}) or {}
     _ss = stats.get('static_stability', {}) or {}
     _sc = stats.get('sigma_convergence', {}) or {}
+    _res = stats.get('residual', {}) or {}
     _sn = stats.get('snr_summary', {}) or {}
     _es = stats.get('envstatus', {}) or {}
     def _g(d, k, fmt='{:.2f}'):
@@ -2948,10 +3036,16 @@ def generate_html_report(output_dir, data, stats, chart_files):
                 <td class="{'pass' if _ss.get('is_static') else 'fail'}">{'✅ 静止' if _ss.get('is_static') else '✗ 非静止(运动数据)'}</td>
             </tr>
             <tr>
-                <td>伪距残差RMS收敛 (GNGST)</td>
+                <td>位置σ收敛 ({_sc.get('source', 'BESTPA')})</td>
                 <td>初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m</td>
                 <td>收敛且小为佳</td>
                 <td class="{'pass' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else 'metric-warning'}">{'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'}</td>
+            </tr>
+            <tr>
+                <td>伪距残差RMS (GNGST)</td>
+                <td>初 {_g(_res, 'init', '{:.3f}')} → 末 {_g(_res, 'final', '{:.3f}')} m / 峰 {_g(_res, 'max', '{:.3f}')} m</td>
+                <td>越小越平稳为佳(测距域)</td>
+                <td class="{'pass' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else 'metric-warning'}">{'✅ 平稳' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else '⚠️ 有尖峰'}</td>
             </tr>
             <tr>
                 <td>载噪比 C/N0 均值</td>
@@ -3050,6 +3144,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     _fc = stats.get('fix_continuity', {}) or {}
     _ss = stats.get('static_stability', {}) or {}
     _sc = stats.get('sigma_convergence', {}) or {}
+    _res = stats.get('residual', {}) or {}
     _sn = stats.get('snr_summary', {}) or {}
     _es = stats.get('envstatus', {}) or {}
     def _g(d, k, fmt='{:.2f}'):
@@ -3077,6 +3172,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     _fc = stats.get('fix_continuity', {}) or {}
     _ss = stats.get('static_stability', {}) or {}
     _sc = stats.get('sigma_convergence', {}) or {}
+    _res = stats.get('residual', {}) or {}
     _sn = stats.get('snr_summary', {}) or {}
     _es = stats.get('envstatus', {}) or {}
     def _g(d, k, fmt='{:.2f}'):
@@ -3131,7 +3227,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 - **天线高度:** {data['antenna_height']:.3f} m (测站上方)
 - **报文完整性(校验位):** 有效 {stats.get('integrity', {}).get('valid', 0):,}/{stats.get('integrity', {}).get('total', 0):,} 条 (通过率 {stats.get('integrity', {}).get('integrity_pct', 0):.1f}%；无效 {stats.get('integrity', {}).get('invalid', 0)} 条) — NMEA XOR: {stats.get('integrity', {}).get('nmea_valid', 0):,}/{stats.get('integrity', {}).get('nmea_total', 0):,} ({stats.get('integrity', {}).get('nmea_pct', 0):.1f}%)；#类 CRC-32(表4-6): {stats.get('integrity', {}).get('hash_valid', 0):,}/{stats.get('integrity', {}).get('hash_total', 0):,} ({stats.get('integrity', {}).get('hash_pct', 0):.1f}%)
 
-## 2. GNSS定位分析 (BESTGNSSPOSA)
+## 2. GNSS定位分析 (BESTPA)
 
 ### 2.1 位置时间序列
 ![位置时间序列](./pos_timeseries.png)
@@ -3149,6 +3245,9 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 ### 2.3 位置精度时间序列
 ![位置精度时间序列](./position_sigma_ts.png)
+
+### 2.3.1 伪距残差RMS时间序列(测距域)
+![伪距残差RMS](./pseudorange_residual_ts.png)
 
 ### 2.4 定位类型分布
 ![定位类型分布](./solution_type_pie.png)
@@ -3218,13 +3317,14 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 | 垂直RMS | {pos_stats['up_rms']:.4f} m | - | - |
 | 固定解水平峰值 | {pos_stats['horizontal_peak']:.4f} m | - | - |
 | 固定解垂直峰值 | {pos_stats['vertical_peak']:.4f} m | - | - |
-| 平均PDOP | {dop_s['pdop']['mean']:.2f} | <3.0 | {'✅ 通过' if dop_s['pdop']['mean'] < 3.0 else '⚠️ 警告'} |
-| 平均HDOP | {dop_s['hdop']['mean']:.2f} | <2.0 | {'✅ 通过' if dop_s['hdop']['mean'] < 2.0 else '⚠️ 警告'} |
+| 平均PDOP | {dop_s['pdop']['mean']:.2f} | <{RTK_STANDARDS['pdop_good']:.0f}.0 | {'✅ 通过' if dop_s['pdop']['mean'] < RTK_STANDARDS['pdop_good'] else '⚠️ 警告'} |
+| 平均HDOP | {dop_s['hdop']['mean']:.2f} | <{RTK_STANDARDS['hdop_good']:.1f} | {'✅ 通过' if dop_s['hdop']['mean'] < RTK_STANDARDS['hdop_good'] else '⚠️ 警告'} |
 | 数据完整性 | {stats['data_completeness']:.1f}% | >99% | {'✅ 通过' if completeness_pass else '⚠️ 警告'} |
 | 数据间隙 | {stats['data_gaps']} 个 | 0 个 | {'✅ 通过' if stats['data_gaps'] == 0 else '⚠️ 警告'} |
 | 固定解连续性 | {_fc_txt} | 越少中断/越短重固定越好 | {'✅ 连续' if _fc.get('interruption_count', 1) == 0 else '⚠️ 有中断'} |
 | 静止性(纯GNSS) | 最大偏移 {_g(_ss, 'max_horizontal_offset', '{:.3f}')} m | ≤{_ss.get('h_threshold', 0.15):.2f} m | {'✅ 静止' if _ss.get('is_static') else '✗ 非静止(运动数据)'} |
-| 伪距残差RMS收敛 (GNGST) | 初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m | 收敛且小为佳 | {'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'} |
+| 位置σ收敛 ({_sc.get('source', 'BESTPA')}) | 初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m | 收敛且小为佳 | {'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'} |
+| 伪距残差RMS (GNGST) | 初 {_g(_res, 'init', '{:.3f}')} → 末 {_g(_res, 'final', '{:.3f}')} m / 峰 {_g(_res, 'max', '{:.3f}')} m | 越小越平稳为佳(测距域) | {'✅ 平稳' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else '⚠️ 有尖峰'} |
 | 载噪比 C/N0 均值 | {_g(_sn, 'mean', '{:.1f}')} dBHz | ≥38开阔/32-37半遮挡/≤31严重 | {'✅ 开阔' if _sn.get('mean', 0) >= 38 else '⚠️ 半遮挡' if _sn.get('mean', 0) >= 32 else '❌ 遮挡'} |
 
 ## 7. 结论
@@ -3468,8 +3568,8 @@ def cli_main():
     stats['msg_periods'] = analyze_periods_huace(build_real_message_periods(message_counts, output_dir))
     stats['fix_continuity'] = calc_fix_continuity(gnss_data)
     stats['static_stability'] = assess_static_stability(gnss_data)
-    stats['sigma_convergence'] = (summarize_gst_rms_convergence(gst_data)
-            if gst_data else summarize_sigma_convergence(gnss_data))
+    stats['sigma_convergence'] = summarize_position_sigma_convergence(gnss_data, gst_data)
+    stats['residual'] = summarize_pseudorange_residual(gst_data)
     stats['snr_summary'] = summarize_snr(gsv_data)
     stats['envstatus'] = summarize_envstatus(envstatus_data)
 
@@ -3481,6 +3581,7 @@ def cli_main():
     chart_files['pos_timeseries'] = chart_position_timeseries(gnss_data, output_dir)
     chart_files['en_scatter'] = chart_en_scatter(gnss_data, output_dir)
     chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_dir, gst_data)
+    chart_files['pseudorange_residual_ts'] = chart_pseudorange_residual(gst_data, output_dir)
     chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_dir)
     # DOP analysis (BESTDOPSA preferred; GSA fallback keeps bynav-compatible behavior)
     # DOP 数据源: GSA 优先(含 VDOP; BESTDOPSA 无 VDOP 字段——手册3.2.12确认)。
@@ -3999,8 +4100,8 @@ class GPSAnalyzerGUI:
             stats['msg_periods'] = analyze_periods_huace(build_real_message_periods(message_counts, output_path))
             stats['fix_continuity'] = calc_fix_continuity(gnss_data)
             stats['static_stability'] = assess_static_stability(gnss_data)
-            stats['sigma_convergence'] = (summarize_gst_rms_convergence(gst_data)
-                    if gst_data else summarize_sigma_convergence(gnss_data))
+            stats['sigma_convergence'] = summarize_position_sigma_convergence(gnss_data, gst_data)
+            stats['residual'] = summarize_pseudorange_residual(gst_data)
             stats['snr_summary'] = summarize_snr(gsv_data)
             stats['envstatus'] = summarize_envstatus(envstatus_data)
 
@@ -4019,6 +4120,7 @@ class GPSAnalyzerGUI:
                     stats['sigma_u'] = en_scatter_result[1].get('sigma_u', 0.0)
             self.log("  - 位置精度时间序列...", 'info')
             chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_path, gst_data)
+            chart_files['pseudorange_residual_ts'] = chart_pseudorange_residual(gst_data, output_path)
             self.log("  - 定位类型分布...", 'info')
             chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_path)
 

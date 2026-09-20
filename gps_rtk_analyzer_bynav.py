@@ -889,6 +889,39 @@ def parse_gsa(lines):
     print(f"Successfully parsed {len(records)} valid GSA records")
     return records
 
+def parse_gst(lines):
+    """解析 $GPGST 伪距噪声统计（UG016 §4.1.7）。
+
+    字段：f1=UTC时间；f2=rms(用于导航计算的伪距标准偏差的平方根值, m, 测距域)；
+    f3/f4=误差椭球长/短半轴标准偏差(m)；f5=长半轴方位(度)；
+    f6/f7/f8=标准纬度/经度/高度偏差(m, 定位域，与 BESTGNSSPOSA σ 同物理量)。
+    返回每条记录的 time_seconds、rms、各标准差字段。
+    """
+    records = []
+    for line in lines:
+        try:
+            fields = line.split('*')[0].split(',')
+            if len(fields) < 9 or not fields[1] or not fields[2]:
+                continue
+            t = fields[1]
+            time_seconds = int(t[0:2]) * 3600 + int(t[2:4]) * 60 + float(t[4:])
+            records.append({
+                'time_seconds': time_seconds,
+                'rms': float(fields[2]),
+                'major_sigma': float(fields[3]) if fields[3] else None,
+                'minor_sigma': float(fields[4]) if fields[4] else None,
+                'orient': float(fields[5]) if fields[5] else None,
+                'lat_sigma': float(fields[6]) if fields[6] else None,
+                'lon_sigma': float(fields[7]) if fields[7] else None,
+                'alt_sigma': float(fields[8]) if fields[8] else None,
+            })
+        except Exception as e:
+            print(f"Warning: Error parsing GST line: {e}")
+            continue
+    print(f"Successfully parsed {len(records)} valid GST records")
+    return records
+
+
 def parse_gsv(lines):
     """
     解析 GSV (GNSS Satellites in View) 消息类型（卫星可见性消息）
@@ -1313,6 +1346,31 @@ def summarize_snr(gsv_data):
         'per_constellation_mean': {c: float(np.mean(v)) for c, v in per_const.items()},
     }
 
+def summarize_pseudorange_residual(gst_data):
+    """伪距残差(测距域)统计 —— 评估观测量噪声/多径健康度，与位置σ(定位域)互补。
+
+    字段来源：GPGST 的 rms（UG016 §4.1.7 Field3：用于导航计算的伪距标准偏差的
+    平方根值，单位 m，测距域）。北云 TRACKSTATA 的 psr_res(伪距滤波残差)设备
+    未启用(本数据集全程恒为0)，故以 GPGST rms 为测距域量——与华测 GNGST rms
+    同物理量、同单位(m)，两设备可比。位置σ为定位域(解算协方差坐标不确定度)。
+    """
+    if not gst_data:
+        return {}
+    rows = sorted(gst_data, key=lambda r: r['time_seconds'])
+    valid = [r for r in rows if r.get('rms') is not None and r['rms'] >= 0]
+    if not valid:
+        return {}
+    t = [r['time_seconds'] for r in valid]
+    rv = [float(r['rms']) for r in valid]
+    k = max(1, len(valid) // 20)
+    return {
+        'source': 'GPGST',
+        'times': t, 'rms': rv,
+        'init': float(np.mean(rv[:k])), 'final': float(np.mean(rv[-k:])),
+        'mean': float(np.mean(rv)), 'max': float(np.max(rv)), 'min': float(np.min(rv)),
+    }
+
+
 # === 北云特有：TRACKSTATA 逐星逐频点 C/N0（UG016 §4.2.26，Message ID 83） ===
 
 def parse_trackstata(lines):
@@ -1649,8 +1707,12 @@ def chart_en_scatter(gnss_data, output_dir):
     sigma_u = np.std(up, ddof=1)
     return filepath.name, {'sigma_u': sigma_u}
 
-def chart_position_sigma(gnss_data, output_dir):
-    """Plot position sigma time series."""
+def chart_position_sigma(gnss_data, output_dir, gst_data=None):
+    """绘制位置σ(定位域)时间序列；有 GPGST 时在第三子图叠加伪距残差RMS(测距域)。
+
+    两个物理量：位置σ=BESTGNSSPOSA Field7-9(定位域,解算协方差坐标不确定度)；
+    伪距残差RMS=GPGST Field3(测距域,观测量噪声,UG016 §4.1.7)。单位均为 m。
+    """
     if not gnss_data:
         return None
 
@@ -1679,6 +1741,7 @@ def chart_position_sigma(gnss_data, output_dir):
     axes[2].set_ylabel('Height σ (m)')
     axes[2].set_xlabel('Time (s since start)')
     axes[2].grid(True, alpha=0.3)
+    # 测距域残差RMS 已拆到独立图 pseudorange_residual_ts.png，不与此图混叠
 
     plt.tight_layout()
 
@@ -1686,6 +1749,35 @@ def chart_position_sigma(gnss_data, output_dir):
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
     plt.close()
     return filepath.name
+
+def chart_pseudorange_residual(gst_data, output_dir):
+    """伪距残差RMS时间序列（测距域）——独立于位置σ图，避免双y轴误导。
+
+    字段：GPGST 的 rms（UG016 §4.1.7 Field3：用于导航计算的伪距标准偏差的平方
+    根值，m）。测距域物理量，多径/遮挡早警器；与定位域位置σ分图呈现。
+    """
+    if not gst_data:
+        return None
+    rows = sorted(gst_data, key=lambda r: r['time_seconds'])
+    t0 = rows[0]['time_seconds']
+    t = [r['time_seconds'] - t0 for r in rows]
+    rms = [r['rms'] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.plot(t, rms, color='darkorange', linewidth=1, label='GPGST pseudorange residual RMS (Field3)')
+    ax.set_ylabel('Residual RMS (m)')
+    ax.set_xlabel('Time (s since start)')
+    ax.set_title('Pseudorange Residual RMS — Ranging Domain (GPGST, UG016 Sec.4.1.7)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    ax.margins(y=0.1)
+    plt.tight_layout()
+
+    filepath = output_dir / 'pseudorange_residual_ts.png'
+    plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
+    plt.close()
+    return filepath.name
+
 
 def chart_solution_type_pie(gnss_data, output_dir):
     """绘制定位类型(pos_type)分布饼图，并返回分布统计。
@@ -1708,7 +1800,7 @@ def chart_solution_type_pie(gnss_data, output_dir):
 
     fig, ax = plt.subplots(figsize=(9, 8))
     ax.pie(counts.values(), labels=labels, autopct='%1.1f%%', startangle=90)
-    ax.set_title('Solution Type Distribution (BESTPOSA/BESTGNSSPOSA)')
+    ax.set_title('Solution Type Distribution (Position Source)')
 
     filepath = output_dir / 'solution_type_pie.png'
     plt.savefig(filepath, dpi=DPI_DEFAULT, bbox_inches='tight')
@@ -2774,6 +2866,10 @@ def generate_html_report(output_dir, data, stats, chart_files):
         </div>
 
         <div class="chart">
+            <img src="data:image/png;base64,{encoded_images.get('pseudorange_residual_ts', '')}" alt="Pseudorange Residual RMS Time Series"/>
+        </div>
+
+        <div class="chart">
             <img src="data:image/png;base64,{encoded_images.get('solution_type_pie', '')}" alt="Solution Type Distribution"/>
         </div>
         <div class="dist-table">{_fmt_solution_dist_html(stats.get('sol_type_dist', {}), POS_TYPE_ENUM)}</div>
@@ -2911,6 +3007,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
     _fc = stats.get('fix_continuity', {}) or {}
     _ss = stats.get('static_stability', {}) or {}
     _sc = stats.get('sigma_convergence', {}) or {}
+    _res = stats.get('residual', {}) or {}
     _sn = stats.get('snr_summary', {}) or {}
     _ts = stats.get('trackstat', {}) or {}
     def _g(d, k, fmt='{:.2f}'):
@@ -3022,10 +3119,16 @@ def generate_html_report(output_dir, data, stats, chart_files):
                 <td class="{'pass' if _ss.get('is_static') else 'fail'}">{'✅ 静止' if _ss.get('is_static') else '✗ 非静止(运动数据)'}</td>
             </tr>
             <tr>
-                <td>sigma收敛(水平)</td>
+                <td>位置σ收敛(定位域)</td>
                 <td>初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m</td>
                 <td>收敛且小为佳</td>
                 <td class="{'pass' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else 'metric-warning'}">{'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'}</td>
+            </tr>
+            <tr>
+                <td>伪距残差RMS(测距域, GPGST)</td>
+                <td>初 {_g(_res, 'init', '{:.3f}')} → 末 {_g(_res, 'final', '{:.3f}')} m / 峰 {_g(_res, 'max', '{:.3f}')} m</td>
+                <td>越小越平稳为佳</td>
+                <td class="{'pass' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else 'metric-warning'}">{'✅ 平稳' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else '⚠️ 有尖峰'}</td>
             </tr>
             <tr>
                 <td>载噪比 C/N0 均值(GSV)</td>
@@ -3115,6 +3218,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     _fc = stats.get('fix_continuity', {}) or {}
     _ss = stats.get('static_stability', {}) or {}
     _sc = stats.get('sigma_convergence', {}) or {}
+    _res = stats.get('residual', {}) or {}
     _sn = stats.get('snr_summary', {}) or {}
     _ts = stats.get('trackstat', {}) or {}
     def _g(d, k, fmt='{:.2f}'):
@@ -3193,6 +3297,9 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 ### 2.3 位置精度时间序列
 ![位置精度时间序列](./position_sigma_ts.png)
+
+### 2.3.1 伪距残差RMS时间序列(测距域)
+![伪距残差RMS](./pseudorange_residual_ts.png)
 
 ### 2.4 定位类型分布
 ![定位类型分布](./solution_type_pie.png)
@@ -3292,7 +3399,8 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 | 数据间隙 | 0 个 | 0 个 | ✅ 通过 |
 | 固定解连续性 | {_fc_txt} | 越少中断/越短重固定越好 | {'✅ 连续' if _fc.get('interruption_count', 1) == 0 else '⚠️ 有中断'} |
 | 静止性(纯GNSS) | 最大偏移 {_g(_ss, 'max_horizontal_offset', '{:.3f}')} m | ≤{_ss.get('h_threshold', 0.15):.2f} m | {'✅ 静止' if _ss.get('is_static') else '✗ 非静止(运动数据)'} |
-| sigma收敛(水平) | 初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m | 收敛且小为佳 | {'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'} |
+| 位置σ收敛(定位域) | 初 {_g(_sc, 'h_init', '{:.3f}')} → 末 {_g(_sc, 'h_final', '{:.3f}')} m | 收敛且小为佳 | {'✅ 收敛' if _sc.get('h_final', 9) < _sc.get('h_init', 0) else '⚠️ 未明显收敛'} |
+| 伪距残差RMS(测距域, GPGST) | 初 {_g(_res, 'init', '{:.3f}')} → 末 {_g(_res, 'final', '{:.3f}')} m / 峰 {_g(_res, 'max', '{:.3f}')} m | 越小越平稳为佳 | {'✅ 平稳' if _res.get('final', 9) <= _res.get('init', 0)*1.5 else '⚠️ 有尖峰'} |
 | 载噪比 C/N0 均值(GSV) | {_g(_sn, 'mean', '{:.1f}')} dBHz | ≥38开阔/32-37半遮挡/≤31严重 | {'✅ 开阔' if _sn.get('mean', 0) >= 38 else '⚠️ 半遮挡' if _sn.get('mean', 0) >= 32 else '❌ 遮挡'} |
 
 ## 7. 结论
@@ -3306,7 +3414,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 - 接收机位置稳定，观测环境良好
 
 ### 注意事项
-- CPE95为3.6厘米，略高于理想值（<2cm），但仍属可接受范围
+- CPE95为{pos_stats['cep95']*100:.1f}厘米，{'达到行业标准（<2cm）' if pos_stats['cep95'] <= RTK_STANDARDS['cep95_rtk_fixed'] else '略高于理想值（<2cm），但仍属可接受范围'}
 - 垂直RMS略高于水平RMS，这是静态测量的典型特征
 - INS系统对齐后，与GNSS的一致性良好
 
@@ -3378,6 +3486,7 @@ def cli_main():
     gsa_data = []
     gsv_data = []
     trackstat_data = []
+    gst_data = []
 
     # Parse each message type
     for msg_type, count in message_counts.items():
@@ -3403,6 +3512,9 @@ def cli_main():
             elif msg_type in ['#TRACKSTATA', 'TRACKSTATA']:
                 trackstat_data = parse_trackstata(lines)
                 print(f"解析了 {len(trackstat_data):,} 条TRACKSTATA消息")
+            elif msg_type in ['$GPGST', '$GNGST']:
+                gst_data = parse_gst(lines)
+                print(f"解析了 {len(gst_data):,} 条GST消息")
             elif msg_type in ['$GPGSV', '$GLGSV', '$GAGSV', '$GQGSV', '$GBGSV']:
                 # Process all GSV messages together for proper epoch detection
                 if msg_type == '$GPGSV':
@@ -3518,6 +3630,7 @@ def cli_main():
     stats['fix_continuity'] = calc_fix_continuity(gnss_data)
     stats['static_stability'] = assess_static_stability(gnss_data)
     stats['sigma_convergence'] = summarize_sigma_convergence(gnss_data)
+    stats['residual'] = summarize_pseudorange_residual(gst_data)
     stats['snr_summary'] = summarize_snr(gsv_data)
     stats['trackstat'] = summarize_trackstat_cno(trackstat_data)
 
@@ -3528,7 +3641,8 @@ def cli_main():
     # GNSS analysis
     chart_files['pos_timeseries'] = chart_position_timeseries(gnss_data, output_dir)
     chart_files['en_scatter'] = chart_en_scatter(gnss_data, output_dir)
-    chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_dir)
+    chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_dir, gst_data)
+    chart_files['pseudorange_residual_ts'] = chart_pseudorange_residual(gst_data, output_dir)
     chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_dir)
     # DOP analysis
     chart_files['dop_timeseries'] = chart_dop_timeseries(gsa_data, output_dir, gga_data)
@@ -3937,6 +4051,7 @@ class GPSAnalyzerGUI:
             gsa_data = []
             gsv_data = []
             trackstat_data = []
+            gst_data = []
 
             for msg_type, count in message_counts.items():
                 msg_file = output_path / f"{msg_type}.dat"
@@ -3953,6 +4068,9 @@ class GPSAnalyzerGUI:
                     elif msg_type in ['#TRACKSTATA', 'TRACKSTATA']:
                         trackstat_data = parse_trackstata(msg_lines)
                         self.log(f"解析了 {len(trackstat_data):,} 条TRACKSTATA消息", 'info')
+                    elif msg_type in ['$GPGST', '$GNGST']:
+                        gst_data = parse_gst(msg_lines)
+                        self.log(f"解析了 {len(gst_data):,} 条GST消息", 'info')
                     elif msg_type == '$GPGGA':
                         gga_data = parse_gga(msg_lines)
                         self.log(f"解析了 {len(gga_data):,} 条GPGGA消息", 'info')
@@ -4061,6 +4179,7 @@ class GPSAnalyzerGUI:
             stats['fix_continuity'] = calc_fix_continuity(gnss_data)
             stats['static_stability'] = assess_static_stability(gnss_data)
             stats['sigma_convergence'] = summarize_sigma_convergence(gnss_data)
+            stats['residual'] = summarize_pseudorange_residual(gst_data)
             stats['snr_summary'] = summarize_snr(gsv_data)
             stats['trackstat'] = summarize_trackstat_cno(trackstat_data)
 
@@ -4078,7 +4197,8 @@ class GPSAnalyzerGUI:
                 if en_scatter_result[1]:
                     stats['sigma_u'] = en_scatter_result[1].get('sigma_u', 0.0)
             self.log("  - 位置精度时间序列...", 'info')
-            chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_path)
+            chart_files['position_sigma_ts'] = chart_position_sigma(gnss_data, output_path, gst_data)
+            chart_files['pseudorange_residual_ts'] = chart_pseudorange_residual(gst_data, output_path)
             self.log("  - 定位类型分布...", 'info')
             chart_files['solution_type_pie'], stats['sol_type_dist'] = chart_solution_type_pie(gnss_data, output_path)
 
