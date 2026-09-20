@@ -30,9 +30,12 @@ python -X utf8 gps_rtk_analyzer_huace.py <输入数据文件> -o <输出目录>
 python -X utf8 gnss_static_hmi.py
 ```
 
-`GNSS Static HMI` 仅作为 HMI/启动器，不包含产品解析逻辑。新增产品时，在
-`gnss_static_hmi.py` 的 `PRODUCTS` 注册表中增加一条 `ProductConfig`，指向新的
-产品分析脚本；新脚本需兼容 CLI 调用并在输出目录生成 `report.html`。
+`GNSS Static HMI` 仅作为 HMI/启动器，不包含产品解析逻辑。界面为队列式布局：
+选择产品后可一次添加多个数据文件进入分析队列，点击“开始分析”后按队列依次
+后台调用各产品的 CLI 分析脚本，完成后按勾选自动打开 HTML 报告 / 输出目录，
+并弹出汇总提示。新增产品时，在 `gnss_static_hmi.py` 的 `PRODUCTS` 注册表中
+增加一条 `ProductConfig`，指向新的产品分析脚本；新脚本需兼容 CLI 调用
+（支持 `--no-open`）并在输出目录生成 `report.html`。
 
 ## 核心准则
 
