@@ -645,7 +645,7 @@ def parse_bestgnsspos(lines):
             - lat (float): 纬度（度）
             - lon (float): 经度（度）
             - hgt (float): 高度（米）
-            - undulation (float): 大地水准面高（米）
+            - undulation (float): 高程异常 / geoid undulation（米）
             - lat_sigma (float): 纬度标准差（米）
             - lon_sigma (float): 经度标准差（米）
             - hgt_sigma (float): 高度标准差（米）
@@ -2719,7 +2719,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
 
     # Get location data
     loc = data.get('location', {'lat': 0, 'lon': 0, 'hgt': 0})
-    ant_hgt = data.get('antenna_height', 0)
+    ant_hgt = data.get('undulation', 0)
 
     html_content += f"""
         </table>
@@ -2730,7 +2730,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
         消息是否按周期发送由输出触发方式决定（ONTIME=周期输出；ONNEW/ONCHANGED=数据变化才输出）。</p>
         <p><strong>数据完整性:</strong> {stats.get('data_completeness', 0):.1f}% (共 {stats.get('total_messages', 0):,} 条消息)</p>
         <p><strong>位置信息:</strong> {loc['lat']:.6f}°N, {loc['lon']:.6f}°E, {loc['hgt']:.2f} m (WGS84)</p>
-        <p><strong>天线高度:</strong> {ant_hgt:.3f} m (测站上方)</p>
+        <p><strong>高程异常 (geoid undulation):</strong> {ant_hgt:.3f} m</p>
         <p><strong>报文完整性(校验位):</strong> 有效 {stats.get('integrity', {}).get('valid', 0):,} / {stats.get('integrity', {}).get('total', 0):,} 条
            (通过率 {stats.get('integrity', {}).get('integrity_pct', 0):.1f}%；无效 {stats.get('integrity', {}).get('invalid', 0)} 条)
            — NMEA XOR: {stats.get('integrity', {}).get('nmea_valid', 0):,}/{stats.get('integrity', {}).get('nmea_total', 0):,} ({stats.get('integrity', {}).get('nmea_pct', 0):.1f}%)；
@@ -3224,7 +3224,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     md_content += f"""
 - **数据完整性:** {stats['data_completeness']:.1f}% (共 {stats['total_messages']:,} 条消息)
 - **位置信息:** {data['location']['lat']:.6f}°N, {data['location']['lon']:.6f}°E, {data['location']['hgt']:.2f} m (WGS84)
-- **天线高度:** {data['antenna_height']:.3f} m (测站上方)
+- **高程异常 (geoid undulation):** {data['undulation']:.3f} m
 - **报文完整性(校验位):** 有效 {stats.get('integrity', {}).get('valid', 0):,}/{stats.get('integrity', {}).get('total', 0):,} 条 (通过率 {stats.get('integrity', {}).get('integrity_pct', 0):.1f}%；无效 {stats.get('integrity', {}).get('invalid', 0)} 条) — NMEA XOR: {stats.get('integrity', {}).get('nmea_valid', 0):,}/{stats.get('integrity', {}).get('nmea_total', 0):,} ({stats.get('integrity', {}).get('nmea_pct', 0):.1f}%)；#类 CRC-32(表4-6): {stats.get('integrity', {}).get('hash_valid', 0):,}/{stats.get('integrity', {}).get('hash_total', 0):,} ({stats.get('integrity', {}).get('hash_pct', 0):.1f}%)
 
 ## 2. GNSS定位分析 (BESTPA)
@@ -3542,7 +3542,7 @@ def cli_main():
                 'lon': first_point['lon'],
                 'hgt': first_point['hgt']
             },
-            'antenna_height': first_point['undulation'],
+            'undulation': first_point['undulation'],
             'gnss_data': gnss_data,
             'gsa_data': gsa_data,
             'bestdops_data': bestdops_data,
@@ -3554,7 +3554,7 @@ def cli_main():
             'filename': input_path.name,
             'message_counts': message_counts,
             'location': {'lat': 0, 'lon': 0, 'hgt': 0},
-            'antenna_height': 0,
+            'undulation': 0,
             'gnss_data': gnss_data,
             'gsa_data': gsa_data,
             'envstatus_data': envstatus_data,
@@ -4077,7 +4077,7 @@ class GPSAnalyzerGUI:
                         'lon': first_point['lon'],
                         'hgt': first_point['hgt']
                     },
-                    'antenna_height': first_point['undulation'],
+                    'undulation': first_point['undulation'],
                     'gnss_data': gnss_data,
                     'gsa_data': gsa_data,
                     'envstatus_data': envstatus_data,
@@ -4087,7 +4087,7 @@ class GPSAnalyzerGUI:
                     'filename': input_path.name,
                     'message_counts': message_counts,
                     'location': {'lat': 0, 'lon': 0, 'hgt': 0},
-                    'antenna_height': 0,
+                    'undulation': 0,
                     'gnss_data': gnss_data,
                     'gsa_data': gsa_data,
                     'envstatus_data': envstatus_data,
