@@ -49,8 +49,8 @@ WGS84_E2 = 2 * WGS84_F - WGS84_F**2  # First eccentricity squared
 # RTK Static Positioning Industry Standards
 RTK_STANDARDS = {
     'fixed_solution_threshold': 0.95,  # Minimum fix rate (95%)
-    'cep95_rtk_fixed': 0.02,  # 2cm maximum for RTK fixed (meters)
-    'cep95_float': 0.50,  # 50cm maximum for RTK float (meters)
+    'r95_rtk_fixed': 0.02,  # 2cm maximum for RTK fixed (meters)
+    'r95_float': 0.50,  # 50cm maximum for RTK float (meters)
     'pdop_good': 2.0,  # Good PDOP threshold
     'pdop_moderate': 3.0,  # Moderate PDOP threshold
     'hdop_good': 1.5,  # Good HDOP threshold
@@ -1200,7 +1200,7 @@ def parse_nmea_coord(coord_val, direction):
 def get_fixed_records(gnss_data):
     """Return records with a valid computed RTK fixed/float solution.
 
-    Static-precision metrics (CEP95, RMS, peaks) are defined on the steady
+    Static-precision metrics (R95, RMS, peaks) are defined on the steady
     RTK solution; startup SINGLE / NONE epochs are convergence transients and
     must not enter the statistics (they sit meters away from the mean).
     """
@@ -1234,8 +1234,8 @@ def llh_to_enu(lat_deg, lon_deg, hgt, ref_lat_deg, ref_lon_deg, ref_hgt):
 
     return East, North, Up
 
-def calc_cep95(east, north):
-    """Calculate CEP95 (Circular Error Probable at 95%)."""
+def calc_r95(east, north):
+    """Calculate R95: 95th percentile of horizontal radial error from mean."""
     if len(east) == 0 or len(north) == 0:
         return 0.0
 
@@ -1244,8 +1244,8 @@ def calc_cep95(east, north):
     mean_n = np.mean(north)
 
     radial_errors = np.sqrt((east - mean_e)**2 + (north - mean_n)**2)
-    cep95 = np.percentile(radial_errors, 95)
-    return cep95
+    r95 = np.percentile(radial_errors, 95)
+    return r95
 
 def calc_2drms(east, north):
     """Calculate 2DRMS (Twice Distance RMS)."""
@@ -1637,7 +1637,7 @@ def validate_industry_compliance(gnss_data, dop_source=None):
             'message': "✅ 通过" if fix_rate >= RTK_STANDARDS['fixed_solution_threshold'] else "❌ 未通过"
         }
 
-    # Position accuracy (using CEP95) —— 仅基于有效固定解，剔除 NONE/无效历元
+    # Position accuracy (using R95) —— 仅基于有效固定解，剔除 NONE/无效历元
     _fx = get_fixed_records(gnss_data)
     if _fx:
         times = [r['tow'] for r in _fx]
@@ -1651,27 +1651,27 @@ def validate_industry_compliance(gnss_data, dop_source=None):
 
         east, north, up = llh_to_enu(lats, lons, hgts, mean_lat, mean_lon, mean_hgt)
 
-        cep95 = calc_cep95(east, north)
+        r95 = calc_r95(east, north)
         horizontal_rms = np.sqrt(np.mean(east**2 + north**2))
         # 垂直RMS与水平RMS同口径：相对均值的均方根 sqrt(mean(up^2))（行业静态RMS惯例，跨设备统一）
         vertical_rms = np.sqrt(np.mean(up**2))
 
-        metrics['cep95'] = cep95
+        metrics['r95'] = r95
         metrics['horizontal_rms'] = horizontal_rms
         metrics['vertical_rms'] = vertical_rms
 
         # Check against standards
         pos_type = _fx[0].get('pos_type', 'UNKNOWN')
         if pos_type in RTK_FIXED_POS_TYPES:
-            standard = RTK_STANDARDS['cep95_rtk_fixed']
+            standard = RTK_STANDARDS['r95_rtk_fixed']
         else:
-            standard = RTK_STANDARDS['cep95_float']
+            standard = RTK_STANDARDS['r95_float']
 
         compliance['position_accuracy'] = {
-            'value': cep95,
+            'value': r95,
             'standard': standard,
-            'pass': cep95 <= standard,
-            'message': "✅ 通过" if cep95 <= standard else "⚠️ 警告"
+            'pass': r95 <= standard,
+            'message': "✅ 通过" if r95 <= standard else "⚠️ 警告"
         }
 
     # DOP values
@@ -1796,7 +1796,7 @@ def chart_en_scatter(gnss_data, output_dir):
         return None, None
 
     # Scatter/statistics on valid fixed solutions only (startup SINGLE points
-    # are meters away and would dwarf the CEP95 circle).
+    # are meters away and would dwarf the R95 circle).
     fixed = get_fixed_records(gnss_data)
     lats = np.array([r['lat'] for r in fixed])
     lons = np.array([r['lon'] for r in fixed])
@@ -1824,10 +1824,10 @@ def chart_en_scatter(gnss_data, output_dir):
     ax.plot(2*sigma_e * np.cos(theta), 2*sigma_n * np.sin(theta),
             'r--', linewidth=2, label=f'2-sigma (E={2*sigma_e:.4f}m, N={2*sigma_n:.4f}m)')
 
-    # CEP95 circle
-    cep95 = calc_cep95(east, north)
-    circle_cep = Circle((0, 0), cep95, fill=False, color='green',
-                       linewidth=2, label=f'CEP95={cep95:.4f}m')
+    # R95 circle
+    r95 = calc_r95(east, north)
+    circle_cep = Circle((0, 0), r95, fill=False, color='green',
+                       linewidth=2, label=f'R95={r95:.4f}m')
     ax.add_patch(circle_cep)
 
     # Mean marker
@@ -2442,7 +2442,7 @@ def chart_performance_summary(gnss_data, output_dir):
 
     east, north, up = llh_to_enu(lats, lons, hgts, mean_lat, mean_lon, mean_hgt)
 
-    cep95 = calc_cep95(east, north)
+    r95 = calc_r95(east, north)
     horizontal_rms = np.sqrt(np.mean(east**2 + north**2))
     # Vertical RMS: deviation about the mean height (same convention as E/N RMS
     # relative to the mean position in llh_to_enu).
@@ -2466,7 +2466,7 @@ def chart_performance_summary(gnss_data, output_dir):
         ['Metric', 'Value', 'Description'],
         ['Expected/Actual Epochs', f'{expected_count}/{actual_count}', 'Data completeness'],
         ['Fixed Solution Ratio', f'{fix_rate:.1f}%', 'RTK fixed percentage'],
-        ['Position CEP95', f'{cep95:.4f} m', '95% circular error'],
+        ['Position R95', f'{r95:.4f} m', '95% horizontal radial error'],
         ['Horizontal RMS', f'{horizontal_rms:.4f} m', 'sqrt(mean(dE^2+dN^2))'],
         ['Vertical RMS', f'{vertical_rms:.4f} m', 'RMS about mean height'],
         ['Fixed Sol Horizontal Peak', f'{horizontal_peak:.4f} m', 'Max horizontal deviation'],
@@ -2525,7 +2525,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
     pos_stats = {
         'east_std': 0, 'north_std': 0, 'up_std': 0,
         'east_rms': 0, 'north_rms': 0, 'horizontal_rms': 0, 'up_rms': 0,
-        'cep95': 0, 'drms': 0, 'horizontal_peak': 0, 'vertical_peak': 0
+        'r95': 0, 'drms': 0, 'horizontal_peak': 0, 'vertical_peak': 0
     }
 
     if 'gnss_data' in data and data['gnss_data']:
@@ -2548,7 +2548,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
         pos_stats['north_rms'] = np.sqrt(np.mean(north**2))
         pos_stats['horizontal_rms'] = np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2)  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = np.sqrt(np.mean(up**2))
-        pos_stats['cep95'] = calc_cep95(east, north)
+        pos_stats['r95'] = calc_r95(east, north)
         pos_stats['drms'] = calc_2drms(east, north)
         pos_stats['horizontal_peak'] = np.max(np.sqrt(east**2 + north**2))
         pos_stats['vertical_peak'] = np.max(np.abs(up))
@@ -2776,8 +2776,8 @@ def generate_html_report(output_dir, data, stats, chart_files):
                 <td>{pos_stats['up_rms']:.4f}</td>
             </tr>
             <tr>
-                <td>CPE95</td>
-                <td>{pos_stats['cep95']:.4f}</td>
+                <td>R95</td>
+                <td>{pos_stats['r95']:.4f}</td>
                 <td>-</td>
                 <td>-</td>
             </tr>
@@ -2901,7 +2901,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
 
     # Add Quality Assessment Section with calculated values
     fix_rate = stats.get('fix_rate', 0.0) * 100
-    cep95_pass = pos_stats['cep95'] <= RTK_STANDARDS['cep95_rtk_fixed']
+    r95_pass = pos_stats['r95'] <= RTK_STANDARDS['r95_rtk_fixed']
     pdop_pass = pdop_stats['mean'] <= RTK_STANDARDS['pdop_moderate']
     hdop_pass = hdop_stats['mean'] <= RTK_STANDARDS['hdop_moderate']
     data_completeness_pass = stats.get('data_completeness', 0) >= 99.0
@@ -2970,10 +2970,10 @@ def generate_html_report(output_dir, data, stats, chart_files):
                 <td class="{'pass' if fix_rate >= RTK_STANDARDS['fixed_solution_threshold']*100 else 'fail'}">{'通过' if fix_rate >= RTK_STANDARDS['fixed_solution_threshold']*100 else '未通过'}</td>
             </tr>
             <tr>
-                <td>位置CPE95</td>
-                <td>{pos_stats['cep95']:.4f} m</td>
-                <td><{RTK_STANDARDS['cep95_rtk_fixed']:.2f} m (RTK固定)</td>
-                <td class="{'pass' if cep95_pass else 'metric-warning'}">{'✅ 优秀' if pos_stats['cep95'] < RTK_STANDARDS['cep95_rtk_fixed']/2 else '✅ 通过' if cep95_pass else '⚠️ 警告'}</td>
+                <td>位置R95</td>
+                <td>{pos_stats['r95']:.4f} m</td>
+                <td><{RTK_STANDARDS['r95_rtk_fixed']:.2f} m (RTK固定)</td>
+                <td class="{'pass' if r95_pass else 'metric-warning'}">{'✅ 优秀' if pos_stats['r95'] < RTK_STANDARDS['r95_rtk_fixed']/2 else '✅ 通过' if r95_pass else '⚠️ 警告'}</td>
             </tr>
             <tr>
                 <td>水平RMS</td>
@@ -3056,25 +3056,25 @@ def generate_html_report(output_dir, data, stats, chart_files):
         </table>
 
         <h2>7. 结论</h2>
-        <p>本次GPS RTK静态定位测量数据质量总体{'良好' if cep95_pass and pdop_pass and hdop_pass and data_completeness_pass else '一般'}。</p>
+        <p>本次GPS RTK静态定位测量数据质量总体{'良好' if r95_pass and pdop_pass and hdop_pass and data_completeness_pass else '一般'}。</p>
         <ul>
             <li><strong>优点:</strong>
                 <ul>
                     <li>{fix_rate:.1f}%固定解比例，{'完全满足' if fix_rate >= 95 else '基本满足'}RTK定位要求</li>
                     <li>PDOP和HDOP值{'远低于' if pdop_stats['mean'] <= 1.5 else '低于'}行业阈值，卫星几何构型{'优秀' if pdop_stats['mean'] <= 1.5 else '良好'}</li>
                     <li>数据完整性达{stats.get('data_completeness', 0):.1f}%，{'无' if stats.get('data_gaps', 0) == 0 else '存在'}数据间隙</li>
-                    <li>CPE95为{pos_stats['cep95']*100:.1f}厘米，{'达到' if cep95_pass else '未达到'}行业标准</li>
+                    <li>R95为{pos_stats['r95']*100:.1f}厘米，{'达到' if r95_pass else '未达到'}行业标准</li>
                 </ul>
             </li>
             <li><strong>注意事项:</strong>
                 <ul>
-                    <li>CPE95为{pos_stats['cep95']*100:.1f}厘米，{'处于优秀水平' if pos_stats['cep95'] < 0.01 else '略高于理想值（<2cm），但仍属可接受范围' if not cep95_pass else '处于优秀水平'}</li>
+                    <li>R95为{pos_stats['r95']*100:.1f}厘米，{'处于优秀水平' if pos_stats['r95'] < 0.01 else '略高于理想值（<2cm），但仍属可接受范围' if not r95_pass else '处于优秀水平'}</li>
                     <li>垂直RMS({pos_stats['up_rms']*100:.1f}cm){'略高于' if pos_stats['up_rms'] > pos_stats['horizontal_rms'] else '与'}水平RMS({pos_stats['horizontal_rms']*100:.1f}cm)，这是静态测量的典型特征</li>
                 </ul>
             </li>
             <li><strong>建议:</strong>
                 <ul>
-                    <li>{'数据质量优秀，无需特别处理' if cep95_pass else '建议检查CPE95略高的原因，可能是存在少量的多路径效应'}</li>
+                    <li>{'数据质量优秀，无需特别处理' if r95_pass else '建议检查R95略高的原因，可能是存在少量的多路径效应'}</li>
                     <li>{'可以继续使用当前观测环境' if pdop_pass and hdop_pass else '建议选择更好的观测时段或位置以降低DOP值'}</li>
                 </ul>
             </li>
@@ -3096,7 +3096,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
     # Position statistics on valid fixed solutions only (same source as HTML report).
     pos_stats = {'east_std': 0.0, 'north_std': 0.0, 'up_std': 0.0,
                  'east_rms': 0.0, 'north_rms': 0.0, 'horizontal_rms': 0.0, 'up_rms': 0.0,
-                 'cep95': 0.0, 'drms': 0.0, 'horizontal_peak': 0.0, 'vertical_peak': 0.0}
+                 'r95': 0.0, 'drms': 0.0, 'horizontal_peak': 0.0, 'vertical_peak': 0.0}
     fix_rate = 0.0
     if 'gnss_data' in data and data['gnss_data']:
         all_recs = data['gnss_data']
@@ -3116,7 +3116,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
         pos_stats['north_rms'] = float(np.sqrt(np.mean(north**2)))
         pos_stats['horizontal_rms'] = float(np.sqrt(pos_stats['east_rms']**2 + pos_stats['north_rms']**2))  # sqrt(mean(E^2+N^2)) 同口径
         pos_stats['up_rms'] = float(np.sqrt(np.mean(up**2)))
-        pos_stats['cep95'] = float(calc_cep95(east, north))
+        pos_stats['r95'] = float(calc_r95(east, north))
         pos_stats['drms'] = float(calc_2drms(east, north))
         pos_stats['horizontal_peak'] = float(np.max(np.sqrt(east**2 + north**2)))
         pos_stats['vertical_peak'] = float(np.max(np.abs(up)))
@@ -3137,8 +3137,8 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
         if all(v is not None for v in vdop_vals) and any(v > 0 for v in vdop_vals):
             dop_s['vdop'] = calc_statistics(vdop_vals)
 
-    cep95_pass = pos_stats['cep95'] <= RTK_STANDARDS['cep95_rtk_fixed']
-    cep95_eval = '✅ 通过' if cep95_pass else '⚠️ 警告'
+    r95_pass = pos_stats['r95'] <= RTK_STANDARDS['r95_rtk_fixed']
+    r95_eval = '✅ 通过' if r95_pass else '⚠️ 警告'
     completeness_pass = stats['data_completeness'] >= 99.0
     fixrate_pass = fix_rate >= 95.0
     _fc = stats.get('fix_continuity', {}) or {}
@@ -3240,7 +3240,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 | 均值（以均值位置为基准的相对偏移，均值定义上恒为 0） | 0.0000 | 0.0000 | 0.0000 |
 | 标准差 | {pos_stats['east_std']:.4f} | {pos_stats['north_std']:.4f} | {pos_stats['up_std']:.4f} |
 | RMS | {pos_stats['east_rms']:.4f} | {pos_stats['north_rms']:.4f} | {pos_stats['up_rms']:.4f} |
-| CPE95 | {pos_stats['cep95']:.4f} | - | - |
+| R95 | {pos_stats['r95']:.4f} | - | - |
 | 2DRMS | {pos_stats['drms']:.4f} | - | - |
 
 ### 2.3 位置精度时间序列
@@ -3312,7 +3312,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 | 评估指标 | 数值 | 行业标准 | 评估结果 |
 |---------|------|---------|----------|
 | 固定解比例 | {fix_rate:.1f}% | >95% | {'✅ 通过' if fixrate_pass else '⚠️ 警告'} |
-| 位置CPE95 | {pos_stats['cep95']:.4f} m | <0.02 m | {cep95_eval} |
+| 位置R95 | {pos_stats['r95']:.4f} m | <0.02 m | {r95_eval} |
 | 水平RMS | {pos_stats['horizontal_rms']:.4f} m | - | - |
 | 垂直RMS | {pos_stats['up_rms']:.4f} m | - | - |
 | 固定解水平峰值 | {pos_stats['horizontal_peak']:.4f} m | - | - |
@@ -3329,7 +3329,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 ## 7. 结论
 
-本次GPS RTK静态定位测量数据质量总体{'良好' if cep95_pass and fixrate_pass else '一般'}。
+本次GPS RTK静态定位测量数据质量总体{'良好' if r95_pass and fixrate_pass else '一般'}。
 
 ### 优点
 - {fix_rate:.1f}%固定解比例{'，完全满足RTK定位要求' if fixrate_pass else '，未达到95%要求'}
@@ -3338,11 +3338,11 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 - 接收机位置稳定，观测环境良好
 
 ### 注意事项
-- CPE95为{pos_stats['cep95']*100:.1f}厘米，{'达到行业标准（<2cm）' if cep95_pass else '略高于理想值（<2cm），但仍属可接受范围'}
+- R95为{pos_stats['r95']*100:.1f}厘米，{'达到行业标准（<2cm）' if r95_pass else '略高于理想值（<2cm），但仍属可接受范围'}
 - 垂直RMS略高于水平RMS，这是静态测量的典型特征
 
 ### 建议
-- {'数据质量优秀，无需特别处理' if cep95_pass else '建议检查CPE95略高的原因，可能是存在少量的多路径效应'}
+- {'数据质量优秀，无需特别处理' if r95_pass else '建议检查R95略高的原因，可能是存在少量的多路径效应'}
 - 可以增加观测时间，进一步降低随机误差
 """
 
@@ -3652,12 +3652,12 @@ def cli_main():
 
         east, north, up = llh_to_enu(lats, lons, hgts, mean_lat, mean_lon, mean_hgt)
 
-        cep95 = calc_cep95(east, north)
+        r95 = calc_r95(east, north)
         drms = calc_2drms(east, north)
         num_sats = [r.get('num_svs') for r in gnss_data if r.get('num_svs')]
 
         print(f"- 位置信息: {mean_lat:.6f}°N, {mean_lon:.6f}°E")
-        print(f"- CPE95 (固定解): {cep95:.3f} m ({cep95*100:.1f} cm)")
+        print(f"- R95 (固定解): {r95:.3f} m ({r95*100:.1f} cm)")
         print(f"- 2DRMS (固定解): {drms:.3f} m")
         if num_sats:
             print(f"- 跟踪卫星数: 平均 {np.mean(num_sats):.0f} (范围 {min(num_sats)}-{max(num_sats)})")
@@ -4202,11 +4202,11 @@ class GPSAnalyzerGUI:
                 mean_hgt = np.mean(hgts)
 
                 east, north, up = llh_to_enu(lats, lons, hgts, mean_lat, mean_lon, mean_hgt)
-                cep95 = calc_cep95(east, north)
+                r95 = calc_r95(east, north)
                 drms = calc_2drms(east, north)
 
                 self.log(f"- 位置信息: {mean_lat:.6f}°N, {mean_lon:.6f}°E", 'info')
-                self.log(f"- CPE95: {cep95:.3f} m ({cep95*100:.1f} cm)", 'info')
+                self.log(f"- R95: {r95:.3f} m ({r95*100:.1f} cm)", 'info')
                 self.log(f"- 2DRMS: {drms:.3f} m", 'info')
                 self.log(f"- 固定解比例: {fix_rate*100:.1f}%", 'info')
 
