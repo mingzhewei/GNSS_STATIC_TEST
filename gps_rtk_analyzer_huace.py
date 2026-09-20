@@ -22,6 +22,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 import platform
+import webbrowser
 
 import numpy as np
 import matplotlib
@@ -3355,6 +3356,57 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
 # === MAIN PROGRAM ===
 
+
+def open_html_report(html_path):
+    """Open an HTML report with the platform default browser.
+
+    Returns True when an open action was attempted successfully; False means
+    the file was missing or the platform browser could not be invoked.
+    """
+    path = Path(html_path)
+    if not path.is_file():
+        print(f"Warning: HTML report not found: {path}")
+        return False
+
+    try:
+        if webbrowser.open(path.resolve().as_uri()):
+            return True
+        if os.name == 'nt':
+            os.startfile(str(path))
+            return True
+        if sys.platform == 'darwin':
+            os.system(f'open "{path}"')
+            return True
+        os.system(f'xdg-open "{path}"')
+        return True
+    except Exception as e:
+        print(f"Warning: Unable to open HTML report: {e}")
+        return False
+
+
+def notify_cli_complete(output_dir, html_path=None):
+    """Show a CLI completion dialog and automatically open the HTML report."""
+    opened = open_html_report(html_path) if html_path else False
+    if html_path:
+        html_line = f"HTML报告：{html_path}\n（已自动打开）" if opened else f"HTML报告：{html_path}\n（自动打开失败）"
+    else:
+        html_line = "HTML报告：未生成（--no-html）"
+
+    message = (
+        "分析已完成！\n\n"
+        f"输出目录：{output_dir}\n"
+        f"{html_line}"
+    )
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("分析完成", message, parent=root)
+        root.destroy()
+    except Exception as e:
+        print(f"Warning: Unable to show completion dialog: {e}")
+        print(message)
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -3371,6 +3423,7 @@ def parse_args():
     parser.add_argument('--dpi', type=int, default=DPI_DEFAULT, help='图表分辨率 (默认: 150)')
     parser.add_argument('--no-html', action='store_true', help='不生成HTML报告')
     parser.add_argument('--no-md', action='store_true', help='不生成Markdown报告')
+    parser.add_argument('--no-open', action='store_true', help='分析完成后不弹窗、不自动打开HTML报告')
     return parser.parse_args()
 
 def cli_main():
@@ -3622,9 +3675,11 @@ def cli_main():
 
     # Generate reports
     print("生成报告...")
+    html_report_path = None
     if not args.no_html:
         html_report = generate_html_report(output_dir, data, stats, chart_files)
-        print(f"HTML报告已生成: {html_report}")
+        html_report_path = output_dir / html_report
+        print(f"HTML报告已生成: {html_report_path}")
 
     if not args.no_md:
         md_report = generate_markdown_report(output_dir, data, stats, chart_files)
@@ -3663,6 +3718,9 @@ def cli_main():
             print(f"- 跟踪卫星数: 平均 {np.mean(num_sats):.0f} (范围 {min(num_sats)}-{max(num_sats)})")
 
 
+
+    if not args.no_open:
+        notify_cli_complete(output_dir, html_report_path)
 
 # GUI dependencies (used by the merged GUI section below)
 import tkinter as tk
@@ -4170,9 +4228,11 @@ class GPSAnalyzerGUI:
 
             # Generate reports
             self.log("生成报告...", 'info')
+            html_report_path = None
             if self.generate_html.get():
                 html_report = generate_html_report(output_path, data, stats, chart_files)
-                self.log(f"  HTML报告已生成: {html_report}", 'success')
+                html_report_path = output_path / html_report
+                self.log(f"  HTML报告已生成: {html_report_path}", 'success')
 
             if self.generate_md.get():
                 md_report = generate_markdown_report(output_path, data, stats, chart_files)
@@ -4213,8 +4273,8 @@ class GPSAnalyzerGUI:
 
             self.log("=" * 60, 'header')
 
-            # Ask to open output directory
-            self.root.after(0, lambda: self.ask_open_output(output_path))
+            # Notify completion and automatically open the HTML report
+            self.root.after(0, lambda: self.notify_analysis_complete(output_path, html_report_path))
 
         except Exception as e:
             self.log(f"分析过程中发生错误: {str(e)}", 'error')
@@ -4232,21 +4292,21 @@ class GPSAnalyzerGUI:
         self.analyze_button.config(state=tk.NORMAL)
         self.status_var.set("分析完成")
 
-    def ask_open_output(self, output_path):
-        """Ask user if they want to open the output directory."""
-        response = messagebox.askyesno("分析完成",
-                                         "分析已完成！\n\n是否打开输出目录？")
-        if response:
-            try:
-                if os.name == 'nt':  # Windows
-                    os.startfile(output_path)
-                elif os.name == 'posix':  # macOS and Linux
-                    if sys.platform == 'darwin':  # macOS
-                        os.system(f'open "{output_path}"')
-                    else:  # Linux
-                        os.system(f'xdg-open "{output_path}"')
-            except Exception as e:
-                messagebox.showerror("错误", f"无法打开目录: {e}")
+    def notify_analysis_complete(self, output_path, html_report_path=None):
+        """Notify completion and automatically open the generated HTML report."""
+        opened = open_html_report(html_report_path) if html_report_path else False
+        if html_report_path:
+            html_line = (f"HTML报告：{html_report_path}\n"
+                         + ("（已自动打开）" if opened else "（自动打开失败）"))
+        else:
+            html_line = "HTML报告：未生成（未勾选HTML输出）"
+
+        messagebox.showinfo(
+            "分析完成",
+            "分析已完成！\n\n"
+            f"输出目录：{output_path}\n"
+            f"{html_line}"
+        )
 
 
 def gui_main():
