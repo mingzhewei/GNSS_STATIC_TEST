@@ -58,6 +58,14 @@ PRODUCTS: dict[str, ProductConfig] = {
         color="#b03a2e",
         extra_args=("--no-open",),
     ),
+    "beidou": ProductConfig(
+        key="beidou",
+        display_name="北斗 UM980（Unicore N4 静态）",
+        script="gps_rtk_analyzer_beidou.py",
+        filetypes=(("北斗日志", "*.log;*.dat"), ("所有文件", "*.*")),
+        color="#1e8449",
+        extra_args=("--no-open",),
+    ),
 }
 
 
