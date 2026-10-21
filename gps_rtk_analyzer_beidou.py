@@ -39,6 +39,11 @@ from pathlib import Path
 import platform
 import webbrowser
 
+# GUI dependencies（独立 HMI，与北云/华测脚本同款 Tkinter 界面）
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import threading
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
@@ -3626,10 +3631,13 @@ def cli_main():
     else:
         stats['fix_rate'] = 0.0
 
-    # 数据间隙（BESTNAVA 0.1s 标称）
-    if gnss_data:
+    # 数据间隙：以 BESTNAVA 实测中位周期为基准，不写死标称 0.1s。
+    # （本设备可能配置为 1 Hz 输出；写死 0.1s 会把正常 1.0s 历元间隔
+    # 误判为“数据间隙”，与完整性统计自相矛盾。）
+    if gnss_data and len(gnss_data) > 1:
         times = [r['tow'] for r in gnss_data]
-        gaps = detect_data_gaps(times, 0.1, tolerance=5.0)
+        actual_interval = stats.get('sampling_interval', 1.0)
+        gaps = detect_data_gaps(times, actual_interval, tolerance=5.0)
     else:
         gaps = []
     stats['data_gaps'] = len(gaps)
@@ -3695,14 +3703,264 @@ def cli_main():
         notify_cli_complete(output_dir, html_report_path)
 
 
+# =============================================================================
+# GUI（北斗 UM980 独立 HMI，与北云/华测分析脚本内嵌界面同款）
+# =============================================================================
+
+class BeidouAnalyzerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title('北斗 UM980 静态RTK定位数据分析工具（选 UM980 日志文件）')
+        self.root.geometry('820x720')
+        self.root.resizable(True, True)
+
+        self.input_file = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.dpi = tk.IntVar(value=150)
+        self.generate_html = tk.BooleanVar(value=True)
+        self.generate_md = tk.BooleanVar(value=True)
+        self.analyzing = False
+        self._proc = None
+        self._last_output_path = None
+        self._last_html_path = None
+
+        self.create_widgets()
+        self.setup_styles()
+
+    def setup_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except Exception:
+            pass
+        style.configure('Title.TLabel', font=('Arial', 16, 'bold'))
+        style.configure('Header.TLabel', font=('Arial', 11, 'bold'))
+        style.configure('Info.TLabel', font=('Arial', 9))
+        style.configure('Action.TButton', font=('Arial', 10))
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding='10')
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(7, weight=1)
+
+        ttk.Label(main_frame, text='北斗 UM980 静态RTK定位数据分析工具',
+                  style='Title.TLabel').grid(row=0, column=0, columnspan=2,
+                                             pady=(0, 12), sticky=tk.W)
+
+        # 输入文件
+        ttk.Label(main_frame, text='输入数据文件:', style='Header.TLabel').grid(
+            row=1, column=0, columnspan=2, sticky=tk.W)
+        input_frame = ttk.Frame(main_frame)
+        input_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E),
+                         pady=(0, 10))
+        input_frame.columnconfigure(0, weight=1)
+        ttk.Entry(input_frame, textvariable=self.input_file, width=58).grid(
+            row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Button(input_frame, text='浏览...',
+                   command=self.browse_input_file).grid(row=0, column=1)
+
+        # 输出目录
+        ttk.Label(main_frame, text='输出目录:', style='Header.TLabel').grid(
+            row=3, column=0, columnspan=2, sticky=tk.W)
+        output_frame = ttk.Frame(main_frame)
+        output_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E),
+                          pady=(0, 10))
+        output_frame.columnconfigure(0, weight=1)
+        ttk.Entry(output_frame, textvariable=self.output_dir, width=58).grid(
+            row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Button(output_frame, text='浏览...',
+                   command=self.browse_output_dir).grid(row=0, column=1)
+
+        # 选项
+        opt_frame = ttk.LabelFrame(main_frame, text='分析选项', padding='8')
+        opt_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E),
+                       pady=(0, 10))
+        ttk.Label(opt_frame, text='图表DPI:').grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(opt_frame, from_=72, to=600, textvariable=self.dpi,
+                    width=6).grid(row=0, column=1, sticky=tk.W, padx=(5, 20))
+        ttk.Checkbutton(opt_frame, text='生成HTML报告',
+                        variable=self.generate_html).grid(row=0, column=2,
+                                                          sticky=tk.W, padx=5)
+        ttk.Checkbutton(opt_frame, text='生成Markdown报告',
+                        variable=self.generate_md).grid(row=0, column=3,
+                                                        sticky=tk.W, padx=5)
+
+        # 操作按钮
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        self.analyze_button = ttk.Button(btn_frame, text='开始分析',
+                                         command=self.start_analysis,
+                                         style='Action.TButton')
+        self.analyze_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btn_frame, text='打开输出目录',
+                   command=self.open_output_dir).grid(row=0, column=1,
+                                                      padx=(0, 8))
+        ttk.Button(btn_frame, text='打开HTML报告',
+                   command=self.open_html).grid(row=0, column=2)
+        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress.grid(row=6, column=0, columnspan=2,
+                           sticky=(tk.E, tk.S), padx=(0, 0), pady=(0, 8))
+        self.progress.grid_remove()
+
+        # 日志
+        ttk.Label(main_frame, text='分析日志:', style='Header.TLabel').grid(
+            row=7, column=0, columnspan=2, sticky=tk.NW)
+        self.log_text = scrolledtext.ScrolledText(main_frame, width=95,
+                                                  height=24, font=('Consolas', 9))
+        self.log_text.grid(row=8, column=0, columnspan=2,
+                           sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame.rowconfigure(8, weight=1)
+        self.log_text.tag_config('header', foreground='#1a5276',
+                                 font=('Consolas', 9, 'bold'))
+        self.log_text.tag_config('info', foreground='black')
+        self.log_text.tag_config('success', foreground='#1e8449')
+        self.log_text.tag_config('error', foreground='#b03a2e')
+
+        self.status_var = tk.StringVar(value='就绪')
+        ttk.Label(main_frame, textvariable=self.status_var,
+                  style='Info.TLabel').grid(row=9, column=0, columnspan=2,
+                                            sticky=tk.W, pady=(6, 0))
+
+    def browse_input_file(self):
+        filename = filedialog.askopenfilename(
+            title='选择北斗 UM980 数据文件',
+            filetypes=[('北斗日志', '*.log;*.dat'), ('所有文件', '*.*')])
+        if filename:
+            self.input_file.set(filename)
+            input_path = Path(filename)
+            self.output_dir.set(str(input_path.with_name(input_path.stem + '_output')))
+
+    def browse_output_dir(self):
+        dirname = filedialog.askdirectory(title='选择输出目录')
+        if dirname:
+            self.output_dir.set(dirname)
+
+    def log(self, message, level='info'):
+        self.log_text.insert(tk.END, message + '\n', level)
+        self.log_text.see(tk.END)
+
+    def start_analysis(self):
+        if self.analyzing:
+            return
+        input_file = self.input_file.get().strip()
+        if not input_file:
+            messagebox.showerror('错误', '请选择输入数据文件')
+            return
+        if not Path(input_file).exists():
+            messagebox.showerror('错误', f'文件不存在: {input_file}')
+            return
+        output_dir = self.output_dir.get().strip()
+        if not output_dir:
+            input_path = Path(input_file)
+            output_dir = str(input_path.with_name(input_path.stem + '_output'))
+            self.output_dir.set(output_dir)
+
+        cmd = [sys.executable, '-X', 'utf8', str(Path(__file__).resolve()),
+               input_file, '-o', output_dir, '--dpi', str(self.dpi.get()),
+               '--no-open']
+        if not self.generate_html.get():
+            cmd.append('--no-html')
+        if not self.generate_md.get():
+            cmd.append('--no-md')
+
+        self.analyzing = True
+        self.analyze_button.config(state=tk.DISABLED)
+        self.progress.grid()
+        self.progress.start()
+        self.status_var.set('正在分析...')
+        self.log_text.delete(1.0, tk.END)
+        self.log('=' * 60, 'header')
+        self.log('北斗 UM980 静态RTK定位数据分析', 'header')
+        self.log(f'输入文件: {input_file}', 'info')
+        self.log(f'输出目录: {output_dir}', 'info')
+        self.log(f'命令: {" ".join(cmd)}', 'info')
+        self.log('=' * 60, 'header')
+
+        thread = threading.Thread(target=self._run_subprocess,
+                                  args=(cmd, output_dir), daemon=True)
+        thread.start()
+
+    def _run_subprocess(self, cmd, output_dir):
+        try:
+            import subprocess
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace')
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                self.root.after(0, self.log, line.rstrip('\n'), 'info')
+            rc = self._proc.wait()
+            if rc == 0:
+                html_path = Path(output_dir) / 'report.html'
+                self._last_output_path = output_dir
+                self._last_html_path = str(html_path) if html_path.exists() else None
+                self.root.after(0, self.log, '=' * 60, 'header')
+                self.root.after(0, self.log, '分析完成！', 'success')
+                self.root.after(0, lambda: self.notify_complete(output_dir))
+            else:
+                self.root.after(0, self.log, f'分析进程退出码: {rc}', 'error')
+        except Exception as e:
+            self.root.after(0, self.log, f'分析过程中发生错误: {e}', 'error')
+        finally:
+            self._proc = None
+            self.root.after(0, self._reset_ui)
+
+    def _reset_ui(self):
+        self.progress.stop()
+        self.progress.grid_remove()
+        self.analyzing = False
+        self.analyze_button.config(state=tk.NORMAL)
+        self.status_var.set('就绪')
+
+    def notify_complete(self, output_dir):
+        if messagebox.askyesno('分析完成',
+                               f'分析已完成！\n\n输出目录：{output_dir}\n\n'
+                               '是否打开 HTML 报告？'):
+            self.open_html()
+
+    def open_output_dir(self):
+        path = self._last_output_path or self.output_dir.get().strip()
+        if path and Path(path).exists():
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            messagebox.showinfo('提示', '输出目录不存在，请先完成分析。')
+
+    def open_html(self):
+        html_path = None
+        if self._last_html_path:
+            html_path = self._last_html_path
+        else:
+            cand = Path(self.output_dir.get().strip()) / 'report.html'
+            if cand.exists():
+                html_path = str(cand)
+        if html_path and Path(html_path).exists():
+            open_html_report(html_path)
+        else:
+            messagebox.showinfo('提示', 'HTML 报告不存在，请先完成分析。')
+
+
 def gui_main():
-    """图形界面入口：北斗分析程序为 CLI 工具，建议通过统一 HMI 启动。"""
-    print('=' * 60)
-    print('北斗 UM980 分析程序为 CLI 工具，建议通过统一 HMI 启动：')
-    print('  python -X utf8 gnss_static_hmi.py')
-    print('或直接命令行：')
-    print('  python -X utf8 gps_rtk_analyzer_beidou.py <数据文件> -o <输出目录>')
-    print('=' * 60)
+    """独立 HMI 入口（无命令行参数时启动）。"""
+    root = tk.Tk()
+    app = BeidouAnalyzerGUI(root)
+
+    def on_closing():
+        if app.analyzing:
+            if messagebox.askokcancel('退出', '分析正在进行中，确定要退出吗？'):
+                if app._proc is not None:
+                    try:
+                        app._proc.terminate()
+                    except Exception:
+                        pass
+                root.destroy()
+        else:
+            root.destroy()
+
+    root.protocol('WM_DELETE_WINDOW', on_closing)
+    root.mainloop()
 
 
 def main():
