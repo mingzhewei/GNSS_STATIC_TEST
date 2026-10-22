@@ -235,6 +235,66 @@ def _parse_nmea_tod(fields):
         return None
 
 
+class _ParseIssueLog:
+    """聚合解析失败/跳过原因，避免逐条异常刷屏并保留可定位样本。"""
+
+    def __init__(self):
+        self.counts = {}
+        self.samples = {}
+
+    def add(self, reason, line=''):
+        reason = str(reason)
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+        self.samples.setdefault(reason, str(line)[:160])
+
+    def summary(self, label, total, valid):
+        skipped = sum(self.counts.values())
+        if not skipped:
+            return
+        print(f"Warning: {label}: {skipped}/{total} lines skipped or failed, valid={valid}")
+        for reason, count in sorted(self.counts.items(), key=lambda x: (-x[1], x[0]))[:5]:
+            print(f"  - {reason}: {count} line(s); sample: {self.samples[reason]}")
+
+
+def _optional_float(value):
+    """空字符串/None 返回 None；非数值交给调用方按解析失败处理。"""
+    if value is None or value == '':
+        return None
+    return float(value)
+
+
+def _records_with_fields(records, fields, numeric=True):
+    """过滤包含所需字段的记录；只做入口防御，不改变有效数据的分析口径。"""
+    result = []
+    for r in records or []:
+        if not all(k in r and r[k] is not None for k in fields):
+            continue
+        if numeric:
+            try:
+                for k in fields:
+                    float(r[k])
+            except (TypeError, ValueError):
+                continue
+        result.append(r)
+    return result
+
+
+def _position_sigma_availability(gnss_data, gst_data=None):
+    """标注位置σ字段状态；只描述可用性，不改变 BESTPA→GNGST 的既有优先级。"""
+    gnss_sigma = _records_with_fields(
+        gnss_data, ('tow', 'lat_sigma', 'lon_sigma', 'hgt_sigma'))
+    if gnss_sigma:
+        vals = {
+            (r.get('lat_sigma'), r.get('lon_sigma'), r.get('hgt_sigma'))
+            for r in gnss_sigma
+        }
+        return 'constant-output' if len(vals) == 1 else 'parsed'
+    gst_sigma = _records_with_fields(
+        gst_data, ('time_seconds', 'lat_sigma', 'lon_sigma', 'alt_sigma'))
+    if gst_sigma:
+        return 'gngst-fallback'
+    return 'unavailable'
+
 # 32 位 CRC 校验算法：北云 UG016 表 4-6(p71) 与华测手册一致，
 # 均为多项式 0xEDB88320、初值 0、不含 '#' 的块 CRC-32（等价位序反射的 CRC-32 变体，
 # 注意 init=0x00000000，区别于标准 CRC-32/PKZIP 的 init=0xFFFFFFFF）。
@@ -461,13 +521,13 @@ def extract_valid_messages(raw_bytes):
     import re as _re
     n = len(raw_bytes)
     # 收集所有锚点位置 -> (pos, head_bytes)
+    known_heads = set(_HASH_HEADS) | set(_NMEA_HEADS)
     anchors = []
-    for h in _HASH_HEADS:
-        for m in _re.finditer(_re.escape(h), raw_bytes):
-            anchors.append((m.start(), h))
-    for h in _NMEA_HEADS:
-        for m in _re.finditer(_re.escape(h), raw_bytes):
-            anchors.append((m.start(), h))
+    for m in _re.finditer(rb"[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
+        head = m.group(0)
+        if head not in known_heads:
+            continue
+        anchors.append((m.start(), head))
     anchors.sort()
 
     valid_lines = []
@@ -519,7 +579,15 @@ def extract_valid_messages(raw_bytes):
         except UnicodeDecodeError:
             dropped += 1
 
-    stats = {"scanned": scanned, "rescued": rescued, "binary_dropped": dropped}
+    unknown = {}
+    for m in _re.finditer(rb"[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
+        head = m.group(0)
+        if head not in known_heads:
+            unknown[head] = unknown.get(head, 0) + 1
+    top_unknown = sorted(unknown.items(), key=lambda x: (-x[1], x[0]))[:10]
+    stats = {"scanned": scanned, "rescued": rescued, "binary_dropped": dropped,
+             "unknown_anchor_total": sum(unknown.values()),
+             "unknown_anchor_types": dict(top_unknown)}
     return valid_lines, stats
 
 
@@ -767,13 +835,16 @@ def parse_bestpa(lines):
     返回字段与 parse_bestgnsspos 完全一致，保证下游评估/绘图算法原样复用。
     """
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             if ';' not in line:
+                issues.add('missing semicolon', line)
                 continue
             header, payload = line.split(';', 1)
             h_fields = header.split(',')
             if len(h_fields) < 8:
+                issues.add(f'insufficient header fields ({len(h_fields)} < 8)', line)
                 continue
 
             # BESTPA header: [6]=week, [7]=tow in milliseconds
@@ -782,6 +853,7 @@ def parse_bestpa(lines):
 
             p_fields = payload.split('*')[0].split(',')  # 去 CRC
             if len(p_fields) < 23:
+                issues.add(f'insufficient payload fields ({len(p_fields)} < 23)', line)
                 continue
 
             lat = float(p_fields[4]) if p_fields[4] else None
@@ -835,9 +907,10 @@ def parse_bestpa(lines):
                 'ext_sol_stat': p_fields[17] if len(p_fields) > 17 else '',
             })
         except Exception as e:
-            print(f"Error parsing BESTPA: {e}")
+            issues.add(e, line)
             continue
 
+    issues.summary('BESTPA', len(lines), len(records))
     print(f"Successfully parsed {len(records)} valid BESTPA records (10 Hz)")
     return records
 
@@ -845,9 +918,13 @@ def parse_bestpa(lines):
 def parse_gga(lines):
     """Parse GNGGA/GPGGA message type."""
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             fields = line.split('*')[0].split(',')
+            if len(fields) < 14:
+                issues.add(f'insufficient fields ({len(fields)} < 14)', line)
+                continue
             time_str = fields[1]
             lat = float(fields[2])
             lat_dir = fields[3]
@@ -889,18 +966,20 @@ def parse_gga(lines):
                 'station_id': station_id
             })
         except Exception as e:
-            print(f"Error parsing GGA: {e}")
+            issues.add(e, line)
+    issues.summary('GGA', len(lines), len(records))
     return records
 
 
 def parse_gsa(lines):
     """Parse GNGSA/GPGSA message type."""
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             fields = line.split('*')[0].split(',')
             if len(fields) < 18:
-                print(f"Warning: GSA line has insufficient fields: {len(fields)}")
+                issues.add(f'insufficient fields ({len(fields)} < 18)', line)
                 continue
             
             mode = fields[1]
@@ -927,9 +1006,10 @@ def parse_gsa(lines):
                 'vdop': vdop
             })
         except Exception as e:
-            print(f"Warning: Error parsing GSA line: {e}")
+            issues.add(e, line)
             continue
     
+    issues.summary('GSA', len(lines), len(records))
     print(f"Successfully parsed {len(records)} valid GSA records")
     return records
 
@@ -985,23 +1065,28 @@ def parse_bestdopsa(lines):
     (Manual field order differs from NovAtel BESTDOP - do NOT remap.)
     """
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             if ';' not in line:
+                issues.add('missing semicolon', line)
                 continue
             header, payload = line.split(';', 1)
             h_fields = header.split(',')
             if len(h_fields) < 8:
+                issues.add(f'insufficient header fields ({len(h_fields)} < 8)', line)
                 continue
             week = int(h_fields[6])
             tow = float(h_fields[7]) / 1000.0  # ms -> s
             p_fields = payload.split('*', 1)[0].split(',')
             if len(p_fields) < 7:
+                issues.add(f'insufficient payload fields ({len(p_fields)} < 7)', line)
                 continue
             pdop = float(p_fields[0])
             gdop = float(p_fields[1])
             hdop = float(p_fields[2])
             if gdop == 0.0 and pdop == 0.0 and hdop == 0.0:
+                issues.add('startup/invalid DOP (pdop=gdop=hdop=0)', line)
                 continue  # receiver not yet computed DOP (startup records)
             records.append({
                 'week': week,
@@ -1016,8 +1101,9 @@ def parse_bestdopsa(lines):
                 'num_tracked': int(float(p_fields[6])),
             })
         except Exception as e:
-            print(f"Warning: Error parsing BESTDOPSA line: {e}")
+            issues.add(e, line)
             continue
+    issues.summary('BESTDOPSA', len(lines), len(records))
     print(f"Successfully parsed {len(records)} valid BESTDOPSA records")
     return records
 
@@ -1025,26 +1111,34 @@ def parse_bestdopsa(lines):
 def parse_gst(lines):
     """Parse $GNGST pseudorange noise statistics (NMEA 0183 GST)."""
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             fields = line.split('*')[0].split(',')
-            if len(fields) < 9 or not fields[1] or not fields[2]:
+            if len(fields) < 9:
+                issues.add(f'insufficient fields ({len(fields)} < 9)', line)
                 continue
-            t = fields[1]
-            time_seconds = int(t[0:2]) * 3600 + int(t[2:4]) * 60 + float(t[4:])
+            time_seconds = _parse_nmea_tod(fields)
+            if time_seconds is None:
+                issues.add(f'invalid UTC time field ({fields[1]!r})', line)
+                continue
+            if not fields[2]:
+                issues.add('missing RMS field', line)
+                continue
             records.append({
                 'time_seconds': time_seconds,
                 'rms': float(fields[2]),
-                'major_sigma': float(fields[3]) if fields[3] else None,
-                'minor_sigma': float(fields[4]) if fields[4] else None,
-                'orient': float(fields[5]) if fields[5] else None,
-                'lat_sigma': float(fields[6]) if fields[6] else None,
-                'lon_sigma': float(fields[7]) if fields[7] else None,
-                'alt_sigma': float(fields[8]) if fields[8] else None,
+                'major_sigma': _optional_float(fields[3]),
+                'minor_sigma': _optional_float(fields[4]),
+                'orient': _optional_float(fields[5]),
+                'lat_sigma': _optional_float(fields[6]),
+                'lon_sigma': _optional_float(fields[7]),
+                'alt_sigma': _optional_float(fields[8]),
             })
         except Exception as e:
-            print(f"Warning: Error parsing GST line: {e}")
+            issues.add(e, line)
             continue
+    issues.summary('GST', len(lines), len(records))
     print(f"Successfully parsed {len(records)} valid GST records")
     return records
 
@@ -1092,6 +1186,7 @@ def parse_gsv(lines):
         解析过程中的异常会被捕获并打印警告信息，不会抛出异常
     """
     epochs = []
+    issues = _ParseIssueLog()
     
     # Filter valid GSV lines
     gsv_lines = [line for line in lines if line.startswith('$') and line[:6] in CONSTELLATION_MAP]
@@ -1101,6 +1196,9 @@ def parse_gsv(lines):
     for line in gsv_lines:
         try:
             fields = line.split('*')[0].split(',')
+            if len(fields) < 4:
+                issues.add(f'insufficient fields ({len(fields)} < 4)', line)
+                continue
             talker = fields[0]
             if talker not in CONSTELLATION_MAP:
                 continue
@@ -1140,7 +1238,7 @@ def parse_gsv(lines):
             constellation_data[constellation][msg_num]['satellites'].extend(sats)
             
         except Exception as e:
-            print(f"Warning: Error parsing GSV line: {e}")
+            issues.add(e, line)
             continue
     
     all_msg_nums = set()
@@ -1177,6 +1275,7 @@ def parse_gsv(lines):
     if epoch:
         epochs.append(epoch)
     
+    issues.summary('GSV', len(lines), len(epochs))
     print(f"Successfully parsed {len(epochs)} GSV epochs")
     return epochs
 
@@ -1449,6 +1548,10 @@ def summarize_position_sigma_convergence(gnss_data, gst_data=None):
         观测量残差统计，不是位置标准差，**不用于**本评估。
     返回结构与北云 summarize_sigma_convergence 一致，供报告同一模板渲染。
     """
+    gnss_data = _records_with_fields(
+        gnss_data, ('tow', 'lat_sigma', 'lon_sigma', 'hgt_sigma'))
+    gst_data = _records_with_fields(
+        gst_data, ('time_seconds', 'lat_sigma', 'lon_sigma', 'alt_sigma'))
     if gnss_data:
         rows = sorted(gnss_data, key=lambda r: r['tow'])
         valid = [r for r in rows if r.get('lat_sigma') is not None and r.get('lat_sigma', 0) > 0]
@@ -1490,6 +1593,7 @@ def summarize_pseudorange_residual(gst_data):
     (σ≈DOP×σ_range)，反映坐标可信度。
     返回：rms 的初/末/均值/最大值/时间序列（供绘图与报告）。
     """
+    gst_data = _records_with_fields(gst_data, ('time_seconds', 'rms'))
     if not gst_data:
         return {}
     rows = sorted(gst_data, key=lambda r: r['time_seconds'])
@@ -1555,12 +1659,14 @@ def parse_envstatusa(lines):
     时间戳：idle 前置变体头部 TOW 在索引 7，单位毫秒。
     """
     records = []
+    issues = _ParseIssueLog()
     for line in lines:
         try:
             head, _, rest = line.partition(';')
             payload = rest.split('*')[0]
             f = payload.split(',')
             if len(f) < 15:
+                issues.add(f'insufficient payload fields ({len(f)} < 15)', line)
                 continue
             hf = head.split(',')
             tow = float(hf[7]) / 1000.0 if len(hf) > 7 and float(hf[7]) > 1e7 else (float(hf[7]) if len(hf) > 7 else None)
@@ -1580,8 +1686,9 @@ def parse_envstatusa(lines):
                 'pdop': float(f[14]),
             })
         except Exception as e:
-            print(f"Warning: Error parsing ENVSTATUSA line: {e}")
+            issues.add(e, line)
             continue
+    issues.summary('ENVSTATUSA', len(lines), len(records))
     print(f"Successfully parsed {len(records)} valid ENVSTATUSA records")
     return records
 
@@ -1756,7 +1863,9 @@ def validate_industry_compliance(gnss_data, dop_source=None):
 
 def chart_position_timeseries(gnss_data, output_dir):
     """Plot position time series."""
+    gnss_data = _records_with_fields(gnss_data, ('tow', 'lat', 'lon', 'hgt'))
     if not gnss_data:
+        print("Warning: position time-series chart skipped: time/position fields are unavailable")
         return None
 
     # Fixed solutions only; plot ENU offsets (m) about the mean position.
@@ -1793,7 +1902,9 @@ def chart_position_timeseries(gnss_data, output_dir):
 
 def chart_en_scatter(gnss_data, output_dir):
     """Plot East-North scatter plot."""
+    gnss_data = _records_with_fields(gnss_data, ('lat', 'lon', 'hgt'))
     if not gnss_data:
+        print("Warning: East-North scatter chart skipped: position fields are unavailable")
         return None, None
 
     # Scatter/statistics on valid fixed solutions only (startup SINGLE points
@@ -1866,6 +1977,16 @@ def chart_position_sigma(gnss_data, output_dir, gst_data=None):
     if not gnss_data and not gst_data:
         return None
 
+    gnss_data = _records_with_fields(
+        gnss_data, ('tow', 'lat_sigma', 'lon_sigma', 'hgt_sigma'))
+    gst_data = _records_with_fields(
+        gst_data, ('time_seconds', 'rms'), numeric=False)
+    # GST 的位置σ允许为空；绘图时用 NaN 表示“该历元字段缺失”。
+    gst_data = [r for r in gst_data if r.get('rms') is not None]
+    if not gnss_data and not gst_data:
+        print("Warning: position sigma chart skipped: required sigma/time fields are unavailable")
+        return None
+
     # 逐历元判定 BESTPA 位置σ是否为接收机恒定输出（如 M720 部分固件在差分
     # 过渡态下全程输出定值）。恒定则该量无趋势信息，退回 GNGST 画图，
     # 收敛评估侧仍返回 sigma 均值/极差供报告参考（数值本身并非无效）。
@@ -1902,6 +2023,10 @@ def chart_position_sigma(gnss_data, output_dir, gst_data=None):
                       f"{r0['hgt_sigma']:.4f} m (receiver fixed output, no per-epoch trend)")
         else:
             reason = "no BESTPA/BESTPOSA records in log"
+        if not gst_data:
+            print(f"Warning: position sigma chart skipped: {reason}; no valid GNGST time/RMS fallback records")
+            plt.close(fig)
+            return None
         fig.suptitle(f'Position Sigma Time Series (GNGST fallback, CHCNAV M7 Manual Sec.3.1.5)\n{reason}', fontsize=12)
         t0 = gst_data[0]['time_seconds']
         gt = [r['time_seconds'] - t0 for r in gst_data]
@@ -1939,7 +2064,9 @@ def chart_pseudorange_residual(gst_data, output_dir):
     字段：GNGST 的 rms（手册 3.1.5 表3-9 Field3：伪距/DGNSS修正值标准偏差的
     均方根，m）。测距域物理量，多径/遮挡早警器；与定位域位置σ分图呈现。
     """
+    gst_data = _records_with_fields(gst_data, ('time_seconds', 'rms'))
     if not gst_data:
+        print("Warning: pseudorange residual chart skipped: no valid GNGST time/RMS records")
         return None
     rows = sorted(gst_data, key=lambda r: r['time_seconds'])
     t0 = rows[0]['time_seconds']
@@ -2262,7 +2389,10 @@ def chart_snr_distribution(gsv_data, output_dir):
 
 def chart_satellites_used_ts(gnss_data, output_dir):
     """Plot #SVs (tracked) and #solnSVs (used in solution) over time."""
+    gnss_data = _records_with_fields(
+        gnss_data, ('tow', 'num_svs', 'num_soln_svs'))
     if not gnss_data:
+        print("Warning: satellites-used chart skipped: time/satellite-count fields are unavailable")
         return None
 
     # Extract time and satellite counts from BESTPA/BESTGNSSPOSA data
@@ -2425,7 +2555,9 @@ def chart_data_gaps(gaps, output_dir):
 
 def chart_performance_summary(gnss_data, output_dir):
     """Create a performance summary table chart."""
+    gnss_data = _records_with_fields(gnss_data, ('lat', 'lon', 'hgt'))
     if not gnss_data:
+        print("Warning: performance summary chart skipped: position fields are unavailable")
         return None
 
     # Calculate metrics
@@ -2508,6 +2640,36 @@ def encode_image_to_base64(image_path):
     except Exception as e:
         print(f"Error encoding image {image_path}: {e}")
         return ""
+
+_SOURCE_STATE_ZH = {
+    'absent': '未出现在日志',
+    'all-failed': '存在但全部解析失败',
+    'startup-zero': '存在但启动期 DOP 无效',
+    'parsed': '已解析',
+    'constant-output': 'BESTPA σ为接收机恒定输出（无趋势信息，绘图退回 GNGST）',
+    'gngst-fallback': '无 BESTPA σ，使用 GNGST 兜底',
+    'unavailable': '无可用数据',
+}
+
+
+def _missing_sources(data, stats):
+    """返回未正常解析的数据源列表；用于报告明确标注 N/A，而非冒充 0。"""
+    state = stats.get('source_availability') or data.get('source_availability') or {}
+    return [k for k, v in state.items() if v != 'parsed']
+
+
+def _availability_note_html(data, stats):
+    state = stats.get('source_availability') or data.get('source_availability') or {}
+    missing = _missing_sources(data, stats)
+    if not missing:
+        return ""
+    rows = "".join(
+        f"<tr><td>{k}</td><td>{_SOURCE_STATE_ZH.get(state[k], state[k])}</td></tr>"
+        for k in missing
+    )
+    return f"""<p><strong>数据源可用性:</strong> 以下数据源/字段缺失或不可用于趋势分析，相关结果为 N/A，不代表指标为 0。</p>
+<table><tr><th>数据源</th><th>状态</th></tr>{rows}</table>"""
+
 
 def generate_html_report(output_dir, data, stats, chart_files):
     """Generate HTML report with embedded images."""
@@ -2736,6 +2898,7 @@ def generate_html_report(output_dir, data, stats, chart_files):
            (通过率 {stats.get('integrity', {}).get('integrity_pct', 0):.1f}%；无效 {stats.get('integrity', {}).get('invalid', 0)} 条)
            — NMEA XOR: {stats.get('integrity', {}).get('nmea_valid', 0):,}/{stats.get('integrity', {}).get('nmea_total', 0):,} ({stats.get('integrity', {}).get('nmea_pct', 0):.1f}%)；
            #类 CRC-32(表4-6): {stats.get('integrity', {}).get('hash_valid', 0):,}/{stats.get('integrity', {}).get('hash_total', 0):,} ({stats.get('integrity', {}).get('hash_pct', 0):.1f}%)</p>
+        {_availability_note_html(data, stats)}
     """
 
     # Add GNSS Analysis Section
@@ -3092,6 +3255,21 @@ def generate_html_report(output_dir, data, stats, chart_files):
 
     return html_path.name
 
+def _availability_note_md(data, stats):
+    state = stats.get('source_availability') or data.get('source_availability') or {}
+    missing = _missing_sources(data, stats)
+    if not missing:
+        return ""
+    rows = "\n".join(f"| {k} | {_SOURCE_STATE_ZH.get(state[k], state[k])} |" for k in missing)
+    return f"""
+**数据源可用性**：以下数据源/字段缺失或不可用于趋势分析，相关结果为 N/A，不代表指标为 0。
+
+| 数据源 | 状态 |
+|---|---|
+{rows}
+"""
+
+
 def generate_markdown_report(output_dir, data, stats, chart_files):
     """Generate Markdown report with image links."""
     # Position statistics on valid fixed solutions only (same source as HTML report).
@@ -3224,6 +3402,7 @@ def generate_markdown_report(output_dir, data, stats, chart_files):
 
     md_content += f"""
 - **数据完整性:** {stats['data_completeness']:.1f}% (共 {stats['total_messages']:,} 条消息)
+{_availability_note_md(data, stats)}
 - **位置信息:** {data['location']['lat']:.6f}°N, {data['location']['lon']:.6f}°E, {data['location']['hgt']:.2f} m (WGS84)
 - **高程异常 (geoid undulation):** {data['undulation']:.3f} m
 - **报文完整性(校验位):** 有效 {stats.get('integrity', {}).get('valid', 0):,}/{stats.get('integrity', {}).get('total', 0):,} 条 (通过率 {stats.get('integrity', {}).get('integrity_pct', 0):.1f}%；无效 {stats.get('integrity', {}).get('invalid', 0)} 条) — NMEA XOR: {stats.get('integrity', {}).get('nmea_valid', 0):,}/{stats.get('integrity', {}).get('nmea_total', 0):,} ({stats.get('integrity', {}).get('nmea_pct', 0):.1f}%)；#类 CRC-32(表4-6): {stats.get('integrity', {}).get('hash_valid', 0):,}/{stats.get('integrity', {}).get('hash_total', 0):,} ({stats.get('integrity', {}).get('hash_pct', 0):.1f}%)
@@ -3451,6 +3630,10 @@ def cli_main():
     lines, _st = extract_valid_messages(_raw)
     print(f"锚点校验提取 {_st['rescued']} 条完整报文 "
           f"(扫描锚点 {_st['scanned']}, 校验失败/被二进制污染剔除 {_st['binary_dropped']})")
+    _unknown = _st.get('unknown_anchor_types', {})
+    if _unknown:
+        print(f"检测到 {_st.get('unknown_anchor_total', sum(_unknown.values()))} 个未识别消息头锚点: "
+              + ", ".join(f"{k.decode('ascii', 'replace')}×{v}" for k, v in _unknown.items()))
     lines_all = lines
     print(f"共读取 {len(lines):,} 条数据")
 
@@ -3469,6 +3652,16 @@ def cli_main():
     gst_data = []
     envstatus_data = []
     satvis2_data = []
+    source_availability = {
+        'BESTPA/BESTPOSA': 'absent',
+        'GGA': 'absent',
+        'GSA': 'absent',
+        'BESTDOPSA': 'absent',
+        'GST': 'absent',
+        'GSV': 'absent',
+        'ENVSTATUSA': 'absent',
+        'Position sigma': 'unavailable',
+    }
 
     # Parse each message type
     for msg_type, count in message_counts.items():
@@ -3481,26 +3674,35 @@ def cli_main():
             # Handle both formats: with and without # prefix for ComNav messages
             if msg_type in ['#BESTPA', 'BESTPA']:
                 gnss_data = parse_bestpa(lines)
+                source_availability['BESTPA/BESTPOSA'] = 'parsed' if gnss_data else 'all-failed'
                 print(f"解析了 {len(gnss_data):,} 条BESTPA消息(10Hz)")
             elif msg_type in ['#BESTGNSSPOSA', 'BESTGNSSPOSA', '#BESTPOSA', 'BESTPOSA']:
                 # BESTPOSA 仅作兜底：仅当 BESTPA 缺失时才用(1Hz)，避免覆盖10Hz数据
                 if not gnss_data:
                     gnss_data = parse_bestgnsspos(lines)
+                    source_availability['BESTPA/BESTPOSA'] = 'parsed' if gnss_data else 'all-failed'
                     print(f"解析了 {len(gnss_data):,} 条BESTPOSA消息(1Hz兜底)")
             elif msg_type in ['$GNGGA', '$GPGGA']:
                 gga_data = parse_gga(lines)
+                source_availability['GGA'] = 'parsed' if gga_data else 'all-failed'
                 print(f"解析了 {len(gga_data):,} 条GGA消息")
             elif msg_type in ['$GNGSA', '$GPGSA']:
                 gsa_data = parse_gsa(lines)
+                source_availability['GSA'] = 'parsed' if gsa_data else 'all-failed'
                 print(f"解析了 {len(gsa_data):,} 条GSA消息")
             elif msg_type in ['#BESTDOPSA', 'BESTDOPSA']:
                 bestdops_data = parse_bestdopsa(lines)
+                source_availability['BESTDOPSA'] = (
+                    'parsed' if bestdops_data else
+                    ('startup-zero' if count else 'all-failed'))
                 print(f"解析了 {len(bestdops_data):,} 条BESTDOPSA消息")
             elif msg_type in ['$GNGST', '$GPGST']:
                 gst_data = parse_gst(lines)
+                source_availability['GST'] = 'parsed' if gst_data else 'all-failed'
                 print(f"解析了 {len(gst_data):,} 条GST消息")
             elif msg_type in ['#ENVSTATUSA', 'ENVSTATUSA']:
                 envstatus_data = parse_envstatusa(lines)
+                source_availability['ENVSTATUSA'] = 'parsed' if envstatus_data else 'all-failed'
                 print(f"解析了 {len(envstatus_data):,} 条ENVSTATUSA消息")
             elif msg_type in ['#SATVIS2A', 'SATVIS2A']:
                 pass  # SATVIS2A 卫星可见性(华测NovAtel风格头)，本轮仅统计数量
@@ -3534,7 +3736,10 @@ def cli_main():
                                     gnss_lines = [line.strip() for line in f if line.strip()]
 
                     gsv_data = parse_gsv(lines + glonass_lines + galileo_lines + qzss_lines + beidou_lines + navic_lines + gnss_lines)
+                    source_availability['GSV'] = 'parsed' if gsv_data else 'all-failed'
                     print(f"解析了 {len(gsv_data):,} 个GSV历元")
+
+    source_availability['Position sigma'] = _position_sigma_availability(gnss_data, gst_data)
 
     # Calculate statistics
     print("计算统计信息...")
@@ -3542,8 +3747,12 @@ def cli_main():
     # Basic info
     stats = {
         'generated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'total_messages': sum(message_counts.values())
+        'total_messages': sum(message_counts.values()),
+        'source_availability': source_availability
     }
+    for _src, _state in source_availability.items():
+        if _state != 'parsed':
+            print(f"Warning: {_src} unavailable ({_state}); related metrics will be reported as N/A")
 
     # Calculate duration from GGA UTC time
     if gga_data:
@@ -3600,7 +3809,8 @@ def cli_main():
             'gsa_data': gsa_data,
             'bestdops_data': bestdops_data,
             'envstatus_data': envstatus_data,
-            'gsv_data': gsv_data
+            'gsv_data': gsv_data,
+            'source_availability': source_availability
         }
     else:
         data = {
@@ -3611,7 +3821,8 @@ def cli_main():
             'gnss_data': gnss_data,
             'gsa_data': gsa_data,
             'envstatus_data': envstatus_data,
-            'gsv_data': gsv_data
+            'gsv_data': gsv_data,
+            'source_availability': source_availability
         }
 
     stats['time_spans'] = time_spans
@@ -4016,6 +4227,10 @@ class GPSAnalyzerGUI:
                 _raw = _fb.read()
             lines, _st = extract_valid_messages(_raw)
             self.log(f"锚点校验提取 {_st['rescued']} 条完整报文 (剔除 {_st['binary_dropped']})", 'info')
+            _unknown = _st.get('unknown_anchor_types', {})
+            if _unknown:
+                self.log("未识别消息头锚点: " + ", ".join(
+                    f"{k.decode('ascii', 'replace')}×{v}" for k, v in _unknown.items()), 'warning')
             self.log(f"共读取 {len(lines):,} 条数据", 'info')
 
             # Split messages
@@ -4032,6 +4247,12 @@ class GPSAnalyzerGUI:
             bestdops_data = []
             gst_data = []
             envstatus_data = []
+            source_availability = {
+                'BESTPA/BESTPOSA': 'absent', 'GGA': 'absent', 'GSA': 'absent',
+                'BESTDOPSA': 'absent', 'GST': 'absent', 'GSV': 'absent',
+                'ENVSTATUSA': 'absent',
+                'Position sigma': 'unavailable',
+            }
 
             for msg_type, count in message_counts.items():
                 msg_file = output_path / f"{msg_type}.dat"
@@ -4041,25 +4262,34 @@ class GPSAnalyzerGUI:
 
                     if msg_type in ['#BESTPA', 'BESTPA']:
                         gnss_data = parse_bestpa(msg_lines)
+                        source_availability['BESTPA/BESTPOSA'] = 'parsed' if gnss_data else 'all-failed'
                         self.log(f"解析了 {len(gnss_data):,} 条BESTPA消息(10Hz)", 'info')
                     elif msg_type in ['#BESTPOSA', 'BESTPOSA', '#BESTGNSSPOSA', 'BESTGNSSPOSA']:
                         if not gnss_data:
                             gnss_data = parse_bestgnsspos(msg_lines)
+                            source_availability['BESTPA/BESTPOSA'] = 'parsed' if gnss_data else 'all-failed'
                             self.log(f"解析了 {len(gnss_data):,} 条BESTPOSA消息(1Hz兜底)", 'info')
                     elif msg_type in ['$GNGGA', '$GPGGA']:
                         gga_data = parse_gga(msg_lines)
+                        source_availability['GGA'] = 'parsed' if gga_data else 'all-failed'
                         self.log(f"解析了 {len(gga_data):,} 条GGA消息", 'info')
                     elif msg_type in ['$GNGSA', '$GPGSA']:
                         gsa_data = parse_gsa(msg_lines)
+                        source_availability['GSA'] = 'parsed' if gsa_data else 'all-failed'
                         self.log(f"解析了 {len(gsa_data):,} 条GSA消息", 'info')
                     elif msg_type in ['#BESTDOPSA', 'BESTDOPSA']:
                         bestdops_data = parse_bestdopsa(msg_lines)
+                        source_availability['BESTDOPSA'] = (
+                            'parsed' if bestdops_data else
+                            ('startup-zero' if count else 'all-failed'))
                         self.log(f"解析了 {len(bestdops_data):,} 条BESTDOPSA消息", 'info')
                     elif msg_type in ['$GNGST', '$GPGST']:
                         gst_data = parse_gst(msg_lines)
+                        source_availability['GST'] = 'parsed' if gst_data else 'all-failed'
                         self.log(f"解析了 {len(gst_data):,} 条GST消息", 'info')
                     elif msg_type in ['#ENVSTATUSA', 'ENVSTATUSA']:
                         envstatus_data = parse_envstatusa(msg_lines)
+                        source_availability['ENVSTATUSA'] = 'parsed' if envstatus_data else 'all-failed'
                         self.log(f"解析了 {len(envstatus_data):,} 条ENVSTATUSA消息", 'info')
                     elif msg_type == '$GPGSV':
                         # Load other GSV types
@@ -4086,15 +4316,22 @@ class GPSAnalyzerGUI:
 
                         gsv_data = parse_gsv(msg_lines + glonass_lines + galileo_lines +
                                            qzss_lines + beidou_lines + navic_lines)
+                        source_availability['GSV'] = 'parsed' if gsv_data else 'all-failed'
                         self.log(f"解析了 {len(gsv_data):,} 个GSV历元", 'info')
+
+            source_availability['Position sigma'] = _position_sigma_availability(gnss_data, gst_data)
 
             # Calculate statistics
             self.log("计算统计信息...", 'info')
 
             stats = {
                 'generated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'total_messages': sum(message_counts.values())
+                'total_messages': sum(message_counts.values()),
+                'source_availability': source_availability
             }
+            for _src, _state in source_availability.items():
+                if _state != 'parsed':
+                    self.log(f"Warning: {_src} unavailable ({_state}); related metrics will be reported as N/A", 'warning')
 
             # Calculate duration from GPGGA
             if gga_data:
@@ -4139,6 +4376,7 @@ class GPSAnalyzerGUI:
                     'gnss_data': gnss_data,
                     'gsa_data': gsa_data,
                     'envstatus_data': envstatus_data,
+                    'source_availability': source_availability
                 }
             else:
                 data = {
@@ -4149,6 +4387,7 @@ class GPSAnalyzerGUI:
                     'gnss_data': gnss_data,
                     'gsa_data': gsa_data,
                     'envstatus_data': envstatus_data,
+                    'source_availability': source_availability
                 }
 
             stats['time_spans'] = time_spans

@@ -281,16 +281,17 @@ def _records_with_fields(records, fields, numeric=True):
 
 def _position_sigma_availability(gnss_data, gst_data=None):
     """标注位置σ字段状态；只描述可用性，不改变 BESTPA→GNGST 的既有优先级。"""
-    if gnss_data:
+    gnss_sigma = _records_with_fields(
+        gnss_data, ('tow', 'lat_sigma', 'lon_sigma', 'hgt_sigma'))
+    if gnss_sigma:
         vals = {
             (r.get('lat_sigma'), r.get('lon_sigma'), r.get('hgt_sigma'))
-            for r in gnss_data
+            for r in gnss_sigma
         }
         return 'constant-output' if len(vals) == 1 else 'parsed'
-    if any(
-        r.get('time_seconds') is not None and r.get('rms') is not None
-        for r in (gst_data or [])
-    ):
+    gst_sigma = _records_with_fields(
+        gst_data, ('time_seconds', 'lat_sigma', 'lon_sigma', 'alt_sigma'))
+    if gst_sigma:
         return 'gngst-fallback'
     return 'unavailable'
 
@@ -522,7 +523,7 @@ def extract_valid_messages(raw_bytes):
     # 收集所有锚点位置 -> (pos, head_bytes)
     known_heads = set(_HASH_HEADS) | set(_NMEA_HEADS)
     anchors = []
-    for m in _re.finditer(rb"(?<![A-Za-z0-9_])[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
+    for m in _re.finditer(rb"[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
         head = m.group(0)
         if head not in known_heads:
             continue
@@ -579,7 +580,7 @@ def extract_valid_messages(raw_bytes):
             dropped += 1
 
     unknown = {}
-    for m in _re.finditer(rb"(?<![A-Za-z0-9_])[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
+    for m in _re.finditer(rb"[#$][A-Z0-9_-]{3,20}(?=,)", raw_bytes):
         head = m.group(0)
         if head not in known_heads:
             unknown[head] = unknown.get(head, 0) + 1
@@ -921,8 +922,8 @@ def parse_gga(lines):
     for line in lines:
         try:
             fields = line.split('*')[0].split(',')
-            if len(fields) < 15:
-                issues.add(f'insufficient fields ({len(fields)} < 15)', line)
+            if len(fields) < 14:
+                issues.add(f'insufficient fields ({len(fields)} < 14)', line)
                 continue
             time_str = fields[1]
             lat = float(fields[2])
